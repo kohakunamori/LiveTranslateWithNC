@@ -437,7 +437,8 @@ class LiveTranslateApp:
             self._overlay.update_monitor(0.0, 0.0)
         log.info(
             f"Audio preprocessing mode: {display_name} "
-            f"(before VAD, buffer={replacement.latency_seconds:.2f}s)"
+            f"(before VAD, buffer={replacement.latency_seconds:.2f}s, "
+            f"estimated-total={replacement.estimated_total_latency_seconds:.2f}s)"
         )
 
     def _mark_asr_unavailable(self, reason: str, client=None):

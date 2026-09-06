@@ -111,10 +111,10 @@ pip install -r requirements.txt
 设置 → VAD / ASR → 音频预处理：
 
 - `关闭`：保持原有采集音频直接进入 VAD 的行为。
-- `MDX-NET — 低延迟`：使用 `UVR-MDX-NET-Inst_HQ_3.onnx`，约 1.5 秒重叠流式窗口。
-- `MelBand RoFormer — 高质量`：使用 `model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt`，约 1.6 秒重叠流式窗口，并把 RoFormer 原本偏离线的内部 segment 缩短到实时窗口长度。
+- `MDX-NET — 低延迟`：使用 `UVR-MDX-NET-Inst_HQ_3.onnx`。模型仍保留约 1.5 秒上下文，但采用 trailing-window，只保留 64 ms 前视并按 GPU 实测速度动态选择输出 hop；CUDA 路径使用 ORT I/O binding + DLPack，让 Torch STFT → ONNX → Torch iSTFT 的大谱图保持在 GPU 上。
+- `MelBand RoFormer — 高质量`：使用 `model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt`。保留约 1.6 秒模型上下文，并把 RoFormer 原本偏离线的内部 segment 缩短到该实时上下文；控制器同样使用 64 ms 前视的 trailing-window 和自适应 hop。
 
-预处理模型沿用项目现有模型下载窗口下载。两种模式共用一套 `audio-separator` 模型缓存和 `.preprocess-envs/` 下的独立 uv overlay；可兼容的 PyTorch 依赖优先复用主环境。常驻 worker 直接调用已加载模型的内存 `demix()` 路径，不经过文件式 separation API；控制器使用重叠窗口并裁掉边缘后，只把 vocals PCM 送入 VAD。启动时会自动 warmup 并测量推理是否能在实时 hop 预算内完成。两种模式都强烈建议 CUDA。
+预处理模型沿用项目现有模型下载窗口下载。两种模式共用一套 `audio-separator` 模型缓存和 `.preprocess-envs/` 下的独立 uv overlay；可兼容的 PyTorch 依赖优先复用主环境。常驻 worker 直接调用已加载模型的内存 `demix()` 路径，不经过文件式 separation API。控制器不再等待完整模型窗口后输出大块 PCM，而是保留长历史上下文、只输出靠近窗口右端的一小段，并用 64 ms future lookahead 抑制边界伪影；启动时以 48 kHz WASAPI 路径 warmup/benchmark，并按实测推理时间自动选择 hop，给 ASR/翻译的 GPU 使用保留余量。两种模式都强烈建议 CUDA。
 
 流式缓冲方案改编自 MIT 协议项目 [`nnyj/python-audio-separator-live`](https://github.com/nnyj/python-audio-separator-live)，这里只复用模型与 streaming buffer 思路，不使用其 VB-Cable / sounddevice 设备路由层，而是接入 LiveTranslate 现有 WASAPI → VAD → ASR 管线。
 

@@ -111,10 +111,10 @@ Settings → Translation tab:
 Settings → VAD / ASR → Audio Preprocessing:
 
 - `Off` — preserves the original capture → VAD behavior.
-- `MDX-NET — Low latency` — `UVR-MDX-NET-Inst_HQ_3.onnx`, using ~1.5 s overlapping live windows.
-- `MelBand RoFormer — High quality` — `model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt`, using ~1.6 s overlapping live windows with the RoFormer internal segment size shortened to the live window.
+- `MDX-NET — Low latency` — `UVR-MDX-NET-Inst_HQ_3.onnx`. The model keeps ~1.5 s of context, but streaming uses a trailing window with only 64 ms of future lookahead and an output hop selected from the measured GPU speed. On CUDA, ORT I/O binding + DLPack keeps the large Torch STFT → ONNX → Torch iSTFT spectra on the GPU.
+- `MelBand RoFormer — High quality` — `model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt`. The model keeps ~1.6 s of context, the normally offline-oriented RoFormer internal segment is shortened to that live context, and the controller uses the same 64 ms-lookahead trailing window with an adaptive hop.
 
-Optional preprocessing assets are downloaded from the existing model-download dialog. Both modes share one `audio-separator` model cache and one isolated uv overlay under `.preprocess-envs/`; compatible PyTorch dependencies are reused from the main environment where possible. The persistent worker calls the loaded model's in-memory `demix()` path instead of the file-oriented separation API, and the controller trims overlapping window edges before feeding vocals into VAD. A startup warmup/benchmark reports whether inference fits inside the real-time hop budget. CUDA is strongly recommended.
+Optional preprocessing assets are downloaded from the existing model-download dialog. Both modes share one `audio-separator` model cache and one isolated uv overlay under `.preprocess-envs/`; compatible PyTorch dependencies are reused from the main environment where possible. The persistent worker calls the loaded model's in-memory `demix()` path instead of the file-oriented separation API. The controller no longer waits for a full model window and then emits a large central block: it keeps long historical context, emits only a short region near the right edge, and reserves 64 ms of future lookahead for boundary quality. Startup warmup/benchmark uses the 48 kHz WASAPI path and automatically sizes the hop from measured inference time so ASR/translation still have GPU headroom. CUDA is strongly recommended.
 
 The streaming scheme is adapted from [`nnyj/python-audio-separator-live`](https://github.com/nnyj/python-audio-separator-live) (MIT), integrated into LiveTranslate's existing WASAPI → VAD → ASR pipeline rather than using its device-routing layer.
 

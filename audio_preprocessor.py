@@ -21,12 +21,23 @@ from model_manager import (
 log = logging.getLogger("LiveTranslate.AudioPreprocess")
 APP_DIR = Path(__file__).parent
 
-# Keep streaming windows aligned to the application's native 32 ms VAD chunks.
-# python-audio-separator-live uses ~1.6 s windows and ~0.1 s overlap per edge;
-# keep MDX just above the upstream ~1.5 s quality floor and RoFormer at 1.6 s.
+# Keep model context aligned to the application's native 32 ms VAD chunks.
+# The model still sees the proven ~1.5/1.6 s context, but streaming emits only
+# a short trailing hop with a tiny amount of future lookahead. This preserves
+# context quality while cutting algorithmic latency well below one full window.
 _STREAM_CONFIG = {
-    "mdx_net": {"window_chunks": 47, "overlap_chunks": 3},  # 1.504 s
-    "melband_roformer": {"window_chunks": 50, "overlap_chunks": 3},  # 1.600 s
+    "mdx_net": {
+        "window_chunks": 47,  # 1.504 s model context
+        "lookahead_chunks": 2,  # 64 ms future context
+        "min_hop_chunks": 12,  # 384 ms minimum emission cadence
+        "target_hop_rtf": 0.65,
+    },
+    "melband_roformer": {
+        "window_chunks": 50,  # 1.600 s model context
+        "lookahead_chunks": 2,  # 64 ms future context
+        "min_hop_chunks": 16,  # 512 ms minimum emission cadence
+        "target_hop_rtf": 0.60,
+    },
 }
 
 
@@ -64,16 +75,31 @@ class AudioPreprocessor:
         self.chunk_duration = float(chunk_duration)
         self.chunk_samples = max(1, round(self.sample_rate * self.chunk_duration))
         stream_config = _STREAM_CONFIG.get(
-            self.mode, {"window_chunks": 1, "overlap_chunks": 0}
+            self.mode,
+            {
+                "window_chunks": 1,
+                "lookahead_chunks": 0,
+                "min_hop_chunks": 1,
+                "target_hop_rtf": 1.0,
+            },
         )
         self.window_chunks = int(stream_config["window_chunks"])
-        self.overlap_chunks = int(stream_config["overlap_chunks"])
-        self.hop_chunks = max(1, self.window_chunks - 2 * self.overlap_chunks)
+        self.lookahead_chunks = int(stream_config["lookahead_chunks"])
+        self.min_hop_chunks = int(stream_config["min_hop_chunks"])
+        self.target_hop_rtf = float(stream_config["target_hop_rtf"])
+        self.hop_chunks = self.min_hop_chunks
         self.window_samples = self.chunk_samples * self.window_chunks
-        self.overlap_samples = self.chunk_samples * self.overlap_chunks
+        self.lookahead_samples = self.chunk_samples * self.lookahead_chunks
         self.hop_samples = self.chunk_samples * self.hop_chunks
+        self.history_chunks = max(
+            0, self.window_chunks - self.hop_chunks - self.lookahead_chunks
+        )
+        self.history_samples = self.chunk_samples * self.history_chunks
+        self._benchmark_inference_seconds = 0.0
         self._pending_native: list[np.ndarray] = []
         self._pending_mic: list[np.ndarray] = []
+        self._history_native: list[np.ndarray] = []
+        self._history_mic: list[np.ndarray] = []
         self._input_rate: int | None = None
         self._input_channels: int | None = None
         self._has_scheduled_window = False
@@ -95,7 +121,41 @@ class AudioPreprocessor:
     def latency_seconds(self) -> float:
         if self.mode == "off":
             return 0.0
+        # Buffering latency before a trailing hop can be emitted. Inference is
+        # tracked separately because it depends on the current GPU load.
+        return (self.hop_chunks + self.lookahead_chunks) * self.chunk_duration
+
+    @property
+    def model_window_seconds(self) -> float:
+        if self.mode == "off":
+            return 0.0
         return self.window_chunks * self.chunk_duration
+
+    @property
+    def estimated_total_latency_seconds(self) -> float:
+        if self.mode == "off":
+            return 0.0
+        return self.latency_seconds + max(0.0, self._benchmark_inference_seconds)
+
+    def _set_hop_chunks(self, hop_chunks: int) -> None:
+        max_hop = max(1, self.window_chunks - self.lookahead_chunks)
+        self.hop_chunks = max(1, min(int(hop_chunks), max_hop))
+        self.hop_samples = self.chunk_samples * self.hop_chunks
+        self.history_chunks = max(
+            0, self.window_chunks - self.hop_chunks - self.lookahead_chunks
+        )
+        self.history_samples = self.chunk_samples * self.history_chunks
+
+    def _adapt_hop_from_benchmark(self, inference_seconds: float) -> None:
+        inference_seconds = max(0.0, float(inference_seconds))
+        self._benchmark_inference_seconds = inference_seconds
+        required_hop = int(
+            np.ceil(
+                inference_seconds
+                / max(self.target_hop_rtf * self.chunk_duration, 1e-6)
+            )
+        )
+        self._set_hop_chunks(max(self.min_hop_chunks, required_hop))
 
     @property
     def started(self) -> bool:
@@ -118,7 +178,8 @@ class AudioPreprocessor:
             model_dir = audio_preprocessor_model_dir(self.mode)
             log.info(
                 f"Loading audio preprocessor: {self.display_name} "
-                f"(window={self.latency_seconds:.2f}s)"
+                f"(model-context={self.model_window_seconds:.2f}s, "
+                f"initial-buffer={self.latency_seconds:.2f}s)"
             )
             self._proc = subprocess.Popen(
                 [
@@ -131,7 +192,7 @@ class AudioPreprocessor:
                     "--target-sample-rate",
                     str(self.sample_rate),
                     "--window-seconds",
-                    str(self.latency_seconds),
+                    str(self.model_window_seconds),
                 ],
                 cwd=str(APP_DIR),
                 stdin=subprocess.PIPE,
@@ -154,12 +215,13 @@ class AudioPreprocessor:
                 )
 
             # Pay CUDA/ORT kernel setup cost while the model-loading dialog is
-            # visible, then report whether one inference fits inside the streaming
-            # hop budget. This mirrors the upstream live separator's startup test.
+            # visible, then adapt the trailing hop to the measured device speed.
+            # Benchmark 48 kHz because that is the common WASAPI mix rate and
+            # includes the real resampling cost hidden by a 44.1 kHz-only test.
             if self.mode in _STREAM_CONFIG:
-                benchmark_rate = 44100
+                benchmark_rate = 48000
                 benchmark_frames = max(
-                    1, round(benchmark_rate * self.latency_seconds)
+                    1, round(benchmark_rate * self.model_window_seconds)
                 )
                 t = np.arange(benchmark_frames, dtype=np.float32) / benchmark_rate
                 tone = (1e-4 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
@@ -171,21 +233,29 @@ class AudioPreprocessor:
                     output_samples=self.window_samples,
                     warn_slow=False,
                 )
-                benchmark_start = time.perf_counter()
-                self._request(
-                    warmup,
-                    input_rate=benchmark_rate,
-                    output_samples=self.window_samples,
-                    warn_slow=False,
-                )
-                benchmark_elapsed = time.perf_counter() - benchmark_start
+                benchmark_times = []
+                for _ in range(3):
+                    benchmark_start = time.perf_counter()
+                    self._request(
+                        warmup,
+                        input_rate=benchmark_rate,
+                        output_samples=self.window_samples,
+                        warn_slow=False,
+                    )
+                    benchmark_times.append(time.perf_counter() - benchmark_start)
+                benchmark_elapsed = float(np.median(benchmark_times))
+
+                # Keep enough headroom for ASR/translation GPU contention. The
+                # hop is selected once before any live PCM enters the scheduler.
+                self._adapt_hop_from_benchmark(benchmark_elapsed)
                 hop_seconds = self.hop_chunks * self.chunk_duration
                 rtf = benchmark_elapsed / max(hop_seconds, 1e-6)
                 log.info(
                     f"Live separator benchmark: {self.display_name}, "
-                    f"window={self.latency_seconds:.3f}s, "
+                    f"context={self.model_window_seconds:.3f}s, "
                     f"hop={hop_seconds:.3f}s, inference={benchmark_elapsed:.3f}s, "
-                    f"hop-RTF={rtf:.2f}"
+                    f"hop-RTF={rtf:.2f}, lookahead={self.lookahead_chunks * self.chunk_duration:.3f}s, "
+                    f"estimated-total-latency={self.estimated_total_latency_seconds:.3f}s"
                 )
                 if benchmark_elapsed >= hop_seconds:
                     log.warning(
@@ -376,8 +446,8 @@ class AudioPreprocessor:
                     self._input_queue.put_nowait(dropped)
                     raise RuntimeError("audio preprocessor is shutting down")
                 log.warning(
-                    f"Audio preprocessing backlog full; dropped one "
-                    f"{self.latency_seconds:.1f}s window to catch up"
+                    f"Audio preprocessing backlog full; dropped one pending "
+                    f"{self.hop_chunks * self.chunk_duration:.1f}s hop to catch up"
                 )
                 self._input_queue.put_nowait(item)
 
@@ -423,9 +493,88 @@ class AudioPreprocessor:
     def _clear_pending_locked(self) -> None:
         self._pending_native.clear()
         self._pending_mic.clear()
+        self._history_native.clear()
+        self._history_mic.clear()
         self._input_rate = None
         self._input_channels = None
         self._has_scheduled_window = False
+
+    def _build_trailing_window_locked(
+        self,
+        *,
+        output_chunks: int,
+        input_rate: int,
+        channels: int,
+    ) -> tuple[np.ndarray, np.ndarray, int, int]:
+        """Build one fixed-context window whose output lives near the right edge.
+
+        The left side is filled from already-emitted history (zero padded only
+        during startup). The right side contains ``lookahead_chunks`` of future
+        audio when available. Only ``output_chunks`` from the trailing hop are
+        emitted, so the model keeps its long context without imposing a full
+        model-window delay.
+        """
+
+        output_chunks = max(1, min(int(output_chunks), self.hop_chunks))
+        history_needed = self.history_chunks
+        history_native = (
+            list(self._history_native[-history_needed:])
+            if history_needed
+            else []
+        )
+        history_mic = (
+            list(self._history_mic[-history_needed:]) if history_needed else []
+        )
+
+        if self._pending_native:
+            native_template = self._pending_native[0]
+        elif self._history_native:
+            native_template = self._history_native[-1]
+        else:
+            native_frames = max(1, round(input_rate * self.chunk_duration))
+            native_template = np.zeros((native_frames, channels), dtype=np.float32)
+        mic_template = np.zeros(self.chunk_samples, dtype=np.float32)
+
+        left_missing = history_needed - len(history_native)
+        native_chunks = [np.zeros_like(native_template) for _ in range(left_missing)]
+        native_chunks.extend(history_native)
+        mic_chunks = [mic_template.copy() for _ in range(left_missing)]
+        mic_chunks.extend(history_mic)
+
+        live_needed = self.hop_chunks + self.lookahead_chunks
+        available = min(len(self._pending_native), live_needed)
+        native_chunks.extend(self._pending_native[:available])
+        mic_chunks.extend(self._pending_mic[:available])
+        right_missing = live_needed - available
+        native_chunks.extend(np.zeros_like(native_template) for _ in range(right_missing))
+        mic_chunks.extend(mic_template.copy() for _ in range(right_missing))
+
+        if len(native_chunks) != self.window_chunks:
+            raise RuntimeError(
+                f"invalid trailing separator window: {len(native_chunks)} chunks "
+                f"!= {self.window_chunks}"
+            )
+
+        block = np.concatenate(native_chunks, axis=0)
+        mic_block = np.concatenate(mic_chunks, axis=0)
+        output_start = self.history_samples
+        output_end = output_start + output_chunks * self.chunk_samples
+        return block, mic_block, output_start, output_end
+
+    def _consume_output_history_locked(self, output_chunks: int) -> None:
+        output_chunks = max(0, min(int(output_chunks), len(self._pending_native)))
+        if output_chunks <= 0:
+            return
+        self._history_native.extend(self._pending_native[:output_chunks])
+        self._history_mic.extend(self._pending_mic[:output_chunks])
+        del self._pending_native[:output_chunks]
+        del self._pending_mic[:output_chunks]
+        if self.history_chunks <= 0:
+            self._history_native.clear()
+            self._history_mic.clear()
+        else:
+            del self._history_native[: max(0, len(self._history_native) - self.history_chunks)]
+            del self._history_mic[: max(0, len(self._history_mic) - self.history_chunks)]
 
     def process_chunk(
         self,
@@ -456,7 +605,7 @@ class AudioPreprocessor:
                 self._input_channels = channels
             elif self._input_rate != input_rate or self._input_channels != channels:
                 log.info(
-                    "Native audio format changed; resetting separator overlap state: "
+                    "Native audio format changed; resetting separator streaming context: "
                     f"{self._input_rate}Hz/{self._input_channels}ch -> "
                     f"{input_rate}Hz/{channels}ch"
                 )
@@ -467,22 +616,17 @@ class AudioPreprocessor:
 
             self._pending_native.append(chunk)
             self._pending_mic.append(mic)
-            while len(self._pending_native) >= self.window_chunks:
-                block = np.concatenate(
-                    self._pending_native[: self.window_chunks], axis=0
+            while len(self._pending_native) >= (
+                self.hop_chunks + self.lookahead_chunks
+            ):
+                block, mic_block, output_start, output_end = (
+                    self._build_trailing_window_locked(
+                        output_chunks=self.hop_chunks,
+                        input_rate=input_rate,
+                        channels=channels,
+                    )
                 )
-                mic_block = np.concatenate(
-                    self._pending_mic[: self.window_chunks], axis=0
-                )
-                if self._has_scheduled_window:
-                    output_start = self.overlap_samples
-                else:
-                    # Preserve the start of the stream; only the right edge needs
-                    # to be held for the next overlapping window.
-                    output_start = 0
-                output_end = self.window_samples - self.overlap_samples
-                del self._pending_native[: self.hop_chunks]
-                del self._pending_mic[: self.hop_chunks]
+                self._consume_output_history_locked(self.hop_chunks)
                 self._enqueue_block(
                     block,
                     input_rate,
@@ -498,38 +642,25 @@ class AudioPreprocessor:
             return []
         self.start()
         self._raise_worker_error()
-        block = None
-        mic_block = None
-        input_rate = None
-        output_start = 0
-        output_end = 0
+        jobs = []
         with self._lock:
-            if self._pending_native:
-                valid_chunks = len(self._pending_native)
-                input_rate = int(self._input_rate or 44100)
-                channels = int(self._input_channels or 2)
-                if self._has_scheduled_window:
-                    output_start = self.overlap_samples
-                else:
-                    output_start = 0
-                output_end = valid_chunks * self.chunk_samples
-                if output_end > output_start:
-                    native_chunks = list(self._pending_native)
-                    mic_chunks = list(self._pending_mic)
-                    missing = self.window_chunks - valid_chunks
-                    native_frames = max(1, round(input_rate * self.chunk_duration))
-                    for _ in range(max(0, missing)):
-                        native_chunks.append(
-                            np.zeros((native_frames, channels), dtype=np.float32)
-                        )
-                        mic_chunks.append(
-                            np.zeros(self.chunk_samples, dtype=np.float32)
-                        )
-                    block = np.concatenate(native_chunks[: self.window_chunks], axis=0)
-                    mic_block = np.concatenate(mic_chunks[: self.window_chunks], axis=0)
-                self._clear_pending_locked()
-        if block is not None:
-            assert mic_block is not None and input_rate is not None
+            input_rate = int(self._input_rate or 44100)
+            channels = int(self._input_channels or 2)
+            while self._pending_native:
+                output_chunks = min(self.hop_chunks, len(self._pending_native))
+                block, mic_block, output_start, output_end = (
+                    self._build_trailing_window_locked(
+                        output_chunks=output_chunks,
+                        input_rate=input_rate,
+                        channels=channels,
+                    )
+                )
+                jobs.append(
+                    (block, input_rate, mic_block, output_start, output_end)
+                )
+                self._consume_output_history_locked(output_chunks)
+            self._clear_pending_locked()
+        for block, input_rate, mic_block, output_start, output_end in jobs:
             self._enqueue_block(
                 block,
                 input_rate,

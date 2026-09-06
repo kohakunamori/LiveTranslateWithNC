@@ -58,8 +58,8 @@ def test_off_mode_preserves_capture_pcm_contract():
 
 
 @pytest.mark.parametrize("mode", ["mdx_net", "melband_roformer"])
-def test_streaming_overlap_preserves_pcm_timeline(monkeypatch, mode):
-    """Exercise live overlap scheduling without loading an external model."""
+def test_streaming_trailing_window_preserves_pcm_timeline(monkeypatch, mode):
+    """Exercise live trailing-window scheduling without loading an external model."""
     preprocessor = AudioPreprocessor(mode, sample_rate=16000, chunk_duration=0.032)
     monkeypatch.setattr(preprocessor, "start", lambda: None)
     monkeypatch.setattr(
@@ -132,6 +132,68 @@ def test_short_stream_flushes_without_waiting_for_full_window(monkeypatch):
 
     preprocessor._input_queue.put(None)
     preprocessor._processing_thread.join(timeout=2)
+
+
+def test_trailing_scheduler_emits_before_full_model_window(monkeypatch):
+    preprocessor = AudioPreprocessor("mdx_net", sample_rate=16000, chunk_duration=0.032)
+    monkeypatch.setattr(preprocessor, "start", lambda: None)
+    scheduled = []
+
+    def capture_enqueue(block, input_rate, mic_block, output_start, output_end, **kwargs):
+        scheduled.append((block, mic_block, output_start, output_end))
+
+    monkeypatch.setattr(preprocessor, "_enqueue_block", capture_enqueue)
+    needed = preprocessor.hop_chunks + preprocessor.lookahead_chunks
+    assert needed < preprocessor.window_chunks
+
+    for i in range(needed - 1):
+        chunk = np.full((1536, 2), i + 1, dtype=np.float32)
+        preprocessor.process_chunk(chunk, input_rate=48000)
+        assert scheduled == []
+
+    final = np.full((1536, 2), needed, dtype=np.float32)
+    preprocessor.process_chunk(final, input_rate=48000)
+
+    assert len(scheduled) == 1
+    block, mic_block, output_start, output_end = scheduled[0]
+    assert block.shape == (preprocessor.window_chunks * 1536, 2)
+    assert mic_block.shape == (preprocessor.window_samples,)
+    assert output_start == preprocessor.history_samples
+    assert output_end - output_start == preprocessor.hop_samples
+    # Startup gets left-padded history while retaining the full model context.
+    assert np.all(block[: preprocessor.history_chunks * 1536] == 0)
+    assert preprocessor.latency_seconds == pytest.approx(needed * 0.032)
+    assert preprocessor.latency_seconds < preprocessor.model_window_seconds
+
+
+@pytest.mark.parametrize(
+    ("mode", "measured_seconds", "expected_min"),
+    [
+        ("mdx_net", 0.20, 12),
+        ("mdx_net", 0.40, 20),
+        ("melband_roformer", 0.20, 16),
+        ("melband_roformer", 0.40, 21),
+    ],
+)
+def test_adaptive_hop_keeps_gpu_headroom(mode, measured_seconds, expected_min):
+    preprocessor = AudioPreprocessor(mode, sample_rate=16000, chunk_duration=0.032)
+    required = int(
+        np.ceil(
+            measured_seconds
+            / (preprocessor.target_hop_rtf * preprocessor.chunk_duration)
+        )
+    )
+    preprocessor._adapt_hop_from_benchmark(measured_seconds)
+
+    assert preprocessor._benchmark_inference_seconds == pytest.approx(measured_seconds)
+    assert preprocessor.hop_chunks >= expected_min
+    assert preprocessor.hop_chunks >= required
+    assert preprocessor.hop_chunks + preprocessor.lookahead_chunks <= preprocessor.window_chunks
+    assert (
+        measured_seconds / (preprocessor.hop_chunks * preprocessor.chunk_duration)
+        <= preprocessor.target_hop_rtf + 1e-9
+    )
+    assert preprocessor.estimated_total_latency_seconds < preprocessor.model_window_seconds
 
 
 def test_main_pipeline_preprocesses_before_vad():
@@ -396,6 +458,9 @@ def test_optional_live_separator_runtime_is_uv_managed():
     assert '"cudnn_conv_algo_search": "HEURISTIC"' in worker
     assert "download_model_files = _local_model_files" in worker
     assert "actual_ort_providers" in worker
+    assert "OrtValue.from_dlpack" in worker
+    assert "run_with_iobinding" in worker
+    assert "_enable_mdx_cuda_iobinding" in worker
     dependency_lines = [
         line.strip().lower()
         for line in requirements.splitlines()

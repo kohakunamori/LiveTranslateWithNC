@@ -5,7 +5,7 @@ from __future__ import annotations
 The in-memory ``demix`` streaming path is adapted from Nicholas N.'s
 ``python-audio-separator-live`` (MIT), while capture/VAD scheduling stays owned
 by LiveTranslate.  We deliberately avoid the file-based ``separate()`` API so a
-loaded MDX-NET or MelBand RoFormer model can process overlapping live windows.
+loaded MDX-NET or MelBand RoFormer model can process long-context trailing live windows.
 """
 
 import argparse
@@ -14,6 +14,7 @@ import math
 import struct
 import sys
 import traceback
+import types
 import warnings
 from pathlib import Path
 
@@ -82,7 +83,7 @@ def _resample(samples: np.ndarray, source_rate: int, target_rate: int, *, axis: 
 
 
 class AudioSeparatorLiveBackend:
-    """Persistent in-memory MDX/RoFormer separator for overlapping live windows."""
+    """Persistent in-memory MDX/RoFormer separator for trailing live windows."""
 
     def __init__(
         self,
@@ -119,8 +120,8 @@ class AudioSeparatorLiveBackend:
                 # mdx_dim_t_set=8 means an actual native dim_t of 2**8=256.
                 # Keep that native size so audio-separator stays on ONNX Runtime
                 # instead of converting the graph to PyTorch. The outer live
-                # scheduler already overlaps/trims window edges, so a second
-                # internal MDX overlap would only duplicate expensive inference.
+                # scheduler already reuses long trailing context and emits only
+                # the selected hop, so internal MDX overlap would duplicate inference.
                 "segment_size": 256,
                 "overlap": 0.0,
                 "batch_size": 1,
@@ -194,6 +195,7 @@ class AudioSeparatorLiveBackend:
         self.model = self.separator.model_instance
 
         actual_ort_providers = None
+        actual_ort_session = None
         if mode == "mdx_net":
             model_run = getattr(self.model, "model_run", None)
             for cell in getattr(model_run, "__closure__", None) or ():
@@ -202,6 +204,7 @@ class AudioSeparatorLiveBackend:
                 except ValueError:
                     continue
                 if hasattr(candidate, "get_providers"):
+                    actual_ort_session = candidate
                     actual_ort_providers = list(candidate.get_providers())
                     break
             if torch.cuda.is_available() and (
@@ -212,6 +215,8 @@ class AudioSeparatorLiveBackend:
                     "MDX-NET ONNX session did not activate CUDAExecutionProvider; "
                     f"actual providers={actual_ort_providers}"
                 )
+            if torch.cuda.is_available() and actual_ort_session is not None:
+                self._enable_mdx_cuda_iobinding(actual_ort_session)
 
         # RoFormer models normally use an ~8 s inference segment.  For live
         # separation, match that internal segment to our ~1.6 s outer window.
@@ -242,7 +247,8 @@ class AudioSeparatorLiveBackend:
         print(
             f"live separator loaded: mode={mode}, model={model_filename}, "
             f"torch_device={device}, ort_provider={ort_provider}, "
-            f"window={self.window_seconds:.3f}s"
+            f"window={self.window_seconds:.3f}s, "
+            f"mdx_zero_copy={getattr(self, '_mdx_zero_copy_enabled', False)}"
         )
         if mode == "mdx_net" and torch.cuda.is_available() and ort_provider != "CUDAExecutionProvider":
             print(
@@ -250,6 +256,87 @@ class AudioSeparatorLiveBackend:
                 "performance may be insufficient",
                 file=sys.stderr,
             )
+
+    def _enable_mdx_cuda_iobinding(self, ort_session) -> bool:
+        """Keep MDX spectra on CUDA across Torch STFT -> ORT -> Torch iSTFT.
+
+        audio-separator 0.47 normally calls ``spek.cpu().numpy()`` before ORT
+        and returns a NumPy output, causing two large spectrogram round-trips
+        through host RAM for every live window. ORT 1.26 exposes DLPack and I/O
+        binding, so the existing CUDA tensors can be shared directly.
+        """
+
+        self._mdx_zero_copy_enabled = False
+        self._mdx_zero_copy_failed = False
+        try:
+            import onnxruntime as ort
+
+            if not hasattr(ort.OrtValue, "from_dlpack"):
+                return False
+            if not hasattr(ort_session, "io_binding"):
+                return False
+            input_name = ort_session.get_inputs()[0].name
+            output_name = ort_session.get_outputs()[0].name
+        except Exception:
+            return False
+
+        torch = self.torch
+        model = self.model
+        original_model_run = model.model_run
+
+        def _zero_copy_model_run(spek):
+            if not getattr(spek, "is_cuda", False):
+                return original_model_run(spek)
+            try:
+                spek = spek.contiguous()
+                output = torch.empty_like(spek)
+                io_binding = ort_session.io_binding()
+                io_binding.bind_ortvalue_input(
+                    input_name, ort.OrtValue.from_dlpack(spek)
+                )
+                io_binding.bind_ortvalue_output(
+                    output_name, ort.OrtValue.from_dlpack(output)
+                )
+                ort_session.run_with_iobinding(io_binding)
+                return output
+            except Exception as exc:
+                if not self._mdx_zero_copy_failed:
+                    self._mdx_zero_copy_failed = True
+                    print(
+                        f"WARNING: MDX CUDA zero-copy path failed; falling back "
+                        f"to host-copy ORT path: {exc}",
+                        file=sys.stderr,
+                    )
+                return original_model_run(spek)
+
+        def _as_torch(pred):
+            if torch.is_tensor(pred):
+                return pred.to(model.torch_device)
+            return torch.as_tensor(pred, device=model.torch_device)
+
+        def _run_model_zero_copy(model_self, mix, is_match_mix=False):
+            spek = model_self.stft(mix.to(model_self.torch_device))
+            spek[:, :, :3, :] *= 0
+            if is_match_mix:
+                pred = spek
+            elif model_self.enable_denoise:
+                pred = (
+                    _as_torch(model_self.model_run(-spek)) * -0.5
+                    + _as_torch(model_self.model_run(spek)) * 0.5
+                )
+            else:
+                pred = _as_torch(model_self.model_run(spek))
+            return (
+                model_self.stft.inverse(pred)
+                .detach()
+                .cpu()
+                .numpy()
+            )
+
+        model.model_run = _zero_copy_model_run
+        model.run_model = types.MethodType(_run_model_zero_copy, model)
+        self._mdx_zero_copy_enabled = True
+        return True
 
     @staticmethod
     def _vocals_from_demix(model, mix: np.ndarray) -> np.ndarray:
