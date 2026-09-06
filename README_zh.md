@@ -21,7 +21,7 @@ Windows 实时音频翻译工具。捕获系统音频（WASAPI loopback）和可
 ## 功能特性
 
 - **实时翻译管线**：系统音频 → 可选音频预处理 → VAD → ASR → LLM 翻译 → 字幕显示
-- **音频预处理**：关闭 / Demucs v4 / ClearerVoice（MossFormer2 SE），重模型按需使用独立运行环境
+- **音乐预处理**：关闭 / MDX-NET 低延迟 / MelBand RoFormer 高质量实时人声分离
 - **多 ASR 引擎**：faster-whisper、SenseVoice、FunASR Nano、Anime-Whisper
 - **远程 ASR**：通过 HTTP 把语音识别放到 GPU 机器上跑 —— 见 [REMOTE_ASR.md](REMOTE_ASR.md)
 - **兼容任意 OpenAI 格式 API**：DeepSeek、Grok、Qwen、GPT、Ollama、vLLM 等
@@ -111,10 +111,12 @@ pip install -r requirements.txt
 设置 → VAD / ASR → 音频预处理：
 
 - `关闭`：保持原有采集音频直接进入 VAD 的行为。
-- `Demucs v4`：人声/伴奏分离，使用约 8 秒上下文窗口，强烈建议 CUDA。
-- `ClearerVoice / MossFormer2 SE`：语音增强，使用约 4 秒上下文窗口，强烈建议 CUDA。
+- `MDX-NET — 低延迟`：使用 `UVR-MDX-NET-Inst_HQ_3.onnx`，约 1.5 秒重叠流式窗口。
+- `MelBand RoFormer — 高质量`：使用 `model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt`，约 1.6 秒重叠流式窗口，并把 RoFormer 原本偏离线的内部 segment 缩短到实时窗口长度。
 
-预处理模型沿用项目现有模型下载窗口下载。Demucs 与 ClearerVoice 使用 `.preprocess-envs/` 下的独立 uv overlay：PyTorch / Torchaudio 等兼容依赖直接复用主环境，缺失或版本冲突的依赖则保留在独立环境中。开启后，处理后的 PCM 会先进入 VAD，因此 VAD、ASR、翻译和所有后续步骤都基于预处理后的音频工作。
+预处理模型沿用项目现有模型下载窗口下载。两种模式共用一套 `audio-separator` 模型缓存和 `.preprocess-envs/` 下的独立 uv overlay；可兼容的 PyTorch 依赖优先复用主环境。常驻 worker 直接调用已加载模型的内存 `demix()` 路径，不经过文件式 separation API；控制器使用重叠窗口并裁掉边缘后，只把 vocals PCM 送入 VAD。启动时会自动 warmup 并测量推理是否能在实时 hop 预算内完成。两种模式都强烈建议 CUDA。
+
+流式缓冲方案改编自 MIT 协议项目 [`nnyj/python-audio-separator-live`](https://github.com/nnyj/python-audio-separator-live)，这里只复用模型与 streaming buffer 思路，不使用其 VB-Cable / sounddevice 设备路由层，而是接入 LiveTranslate 现有 WASAPI → VAD → ASR 管线。
 
 ## 架构
 
@@ -127,7 +129,7 @@ Audio (WASAPI 32ms) → 可选 AudioPreprocessor → VAD (Silero) → ASR → LL
 main.py                 主入口，管线编排
 ├── audio_capture.py    WASAPI loopback + 麦克风混音
 ├── audio_preprocessor.py 可选预处理缓冲与调度
-├── audio_preprocess_worker.py 隔离的 Demucs / ClearVoice worker
+├── audio_preprocess_worker.py 隔离的 MDX-NET / MelBand RoFormer 实时 worker
 ├── vad_processor.py    Silero VAD
 ├── asr_engine.py       faster-whisper 后端
 ├── asr_funasr.py       统一 FunASR 模型选择后端

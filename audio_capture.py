@@ -2,12 +2,32 @@ import logging
 import threading
 import queue
 import time
+from dataclasses import dataclass
+
 import numpy as np
 import pyaudiowpatch as pyaudio
 
 log = logging.getLogger("LiveTranslate.Audio")
 
 DEVICE_CHECK_INTERVAL = 2.0  # seconds
+
+
+@dataclass(slots=True)
+class CapturedAudio:
+    """One capture quantum in both ASR-ready and native music forms.
+
+    ``mixed_mono`` preserves the historical 16 kHz mono system+mic path used
+    when preprocessing is Off.  ``loopback_native`` retains the untouched
+    WASAPI loopback channels/rate for music separation.  ``mic_mono`` is kept
+    separately so the music separator can process only system audio and the
+    microphone can be re-mixed after the separator with identical buffering.
+    """
+
+    mixed_mono: np.ndarray
+    mic_rms: float | None
+    loopback_native: np.ndarray
+    loopback_rate: int
+    mic_mono: np.ndarray
 
 
 def list_output_devices():
@@ -240,21 +260,50 @@ class AudioCapture:
         if self._running:
             self._restart_event.set()
 
-    def _resample_to_mono(self, data, native_channels, native_rate):
-        """Convert raw bytes to mono float32 at self.sample_rate."""
+    @staticmethod
+    def _decode_native(data, native_channels):
+        """Decode interleaved float32 bytes into frame-major native PCM."""
         audio = np.frombuffer(data, dtype=np.float32)
-        if native_channels > 1:
-            audio = audio.reshape(-1, native_channels).mean(axis=1)
+        channels = max(1, int(native_channels))
+        frames = len(audio) // channels
+        if frames <= 0:
+            return np.empty((0, channels), dtype=np.float32)
+        return np.asarray(audio[: frames * channels].reshape(frames, channels), dtype=np.float32).copy()
+
+    def _resample_array_to_mono(self, audio, native_rate):
+        """Convert frame-major/mono PCM to mono float32 at self.sample_rate."""
+        audio = np.asarray(audio, dtype=np.float32)
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        audio = audio.reshape(-1)
         if native_rate != self.sample_rate:
             ratio = self.sample_rate / native_rate
             n_out = int(len(audio) * ratio)
+            if n_out <= 0:
+                return np.empty(0, dtype=np.float32)
             indices = np.arange(n_out) / ratio
             indices = np.clip(indices, 0, len(audio) - 1)
             idx_floor = indices.astype(np.int64)
             idx_ceil = np.minimum(idx_floor + 1, len(audio) - 1)
             frac = (indices - idx_floor).astype(np.float32)
             audio = audio[idx_floor] * (1 - frac) + audio[idx_ceil] * frac
-        return audio
+        return np.asarray(audio, dtype=np.float32)
+
+    def _resample_to_mono(self, data, native_channels, native_rate):
+        """Compatibility helper for microphone/raw byte conversion."""
+        return self._resample_array_to_mono(
+            self._decode_native(data, native_channels), native_rate
+        )
+
+    def _fit_target_chunk(self, audio):
+        """Keep ASR-side capture quanta exactly aligned to chunk_duration."""
+        expected = max(1, round(self.sample_rate * self.chunk_duration))
+        audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if len(audio) > expected:
+            return audio[:expected].copy()
+        if len(audio) < expected:
+            return np.pad(audio, (0, expected - len(audio))).astype(np.float32)
+        return audio.copy()
 
     def _restart_stream(self):
         """Restart stream with new default device."""
@@ -335,10 +384,15 @@ class AudioCapture:
 
             # Read loopback chunk or generate silence for mic-only mode
             loopback_audio = None
+            loopback_native = None
             if self._loopback_disabled:
                 time.sleep(self.chunk_duration)
-                n_samples = int(self.sample_rate * self.chunk_duration)
+                n_samples = max(1, round(self.sample_rate * self.chunk_duration))
+                native_frames = max(1, round(self._native_rate * self.chunk_duration))
                 loopback_audio = np.zeros(n_samples, dtype=np.float32)
+                loopback_native = np.zeros(
+                    (native_frames, max(1, self._native_channels)), dtype=np.float32
+                )
             else:
                 native_chunk = int(self._native_rate * self.chunk_duration)
                 try:
@@ -352,8 +406,13 @@ class AudioCapture:
                                 native_chunk, exception_on_overflow=False
                             )
                     if data is not None:
-                        loopback_audio = self._resample_to_mono(
-                            data, self._native_channels, self._native_rate
+                        loopback_native = self._decode_native(
+                            data, self._native_channels
+                        )
+                        loopback_audio = self._fit_target_chunk(
+                            self._resample_array_to_mono(
+                                loopback_native, self._native_rate
+                            )
                         )
                 except Exception as e:
                     if self._restart_event.is_set():
@@ -383,13 +442,14 @@ class AudioCapture:
                 except Exception as e:
                     log.warning(f"Mic read error: {e}")
 
-            if loopback_audio is None:
+            if loopback_audio is None or loopback_native is None:
                 time.sleep(0.005)
                 continue
 
             # Mix: take matching length from mic buffer
             audio = loopback_audio
             mic_rms = None
+            mic_chunk = np.zeros(len(loopback_audio), dtype=np.float32)
             if len(self._mic_buf) > 0:
                 n = len(loopback_audio)
                 if len(self._mic_buf) >= n:
@@ -403,10 +463,17 @@ class AudioCapture:
                 audio = loopback_audio + mic_chunk
 
             try:
-                self.audio_queue.put_nowait((audio, mic_rms))
+                captured = CapturedAudio(
+                    mixed_mono=np.asarray(audio, dtype=np.float32),
+                    mic_rms=mic_rms,
+                    loopback_native=np.asarray(loopback_native, dtype=np.float32),
+                    loopback_rate=int(self._native_rate),
+                    mic_mono=np.asarray(mic_chunk, dtype=np.float32),
+                )
+                self.audio_queue.put_nowait(captured)
             except queue.Full:
                 self.audio_queue.get_nowait()
-                self.audio_queue.put_nowait((audio, mic_rms))
+                self.audio_queue.put_nowait(captured)
 
     def start(self):
         self._loopback_disabled = self._device_name == "__disabled__"

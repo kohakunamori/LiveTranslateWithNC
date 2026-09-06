@@ -1825,7 +1825,7 @@ class LiveTranslateApp:
                 if self._vad._is_speaking and not self._paused:
                     # These zero chunks are VAD control padding generated only
                     # after all captured PCM has been preprocessed. Running them
-                    # through Demucs/ClearVoice would add seconds of useless work.
+                    # through the live music separator would add useless work.
                     n = self._vad._get_effective_silence_limit() + 1
                     for _ in range(n):
                         with self._vad_lock:
@@ -1835,14 +1835,22 @@ class LiveTranslateApp:
                             break
                 continue
 
-            chunk, mic_rms = item
+            chunk = item.mixed_mono
+            mic_rms = item.mic_rms
 
             if self._paused:
                 continue
 
             try:
                 with self._audio_preprocess_lock:
-                    processed_chunks = self._audio_preprocessor.process_chunk(chunk)
+                    if self._audio_preprocessor.mode == "off":
+                        processed_chunks = self._audio_preprocessor.process_chunk(chunk)
+                    else:
+                        processed_chunks = self._audio_preprocessor.process_chunk(
+                            item.loopback_native,
+                            input_rate=item.loopback_rate,
+                            mic_chunk=item.mic_mono,
+                        )
             except Exception as exc:
                 log.error(
                     f"Audio preprocessing failed; falling back to Off: {exc}",

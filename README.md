@@ -21,7 +21,7 @@ Works with any system audio — videos, livestreams, voice chat. No player modif
 ## Features
 
 - **Real-time pipeline**: System audio → optional preprocessing → VAD → ASR → LLM translation → overlay
-- **Audio preprocessing**: Off / Demucs v4 / ClearerVoice (MossFormer2 SE), with isolated on-demand model runtimes
+- **Music preprocessing**: Off / MDX-NET low-latency / MelBand RoFormer high-quality live vocal separation
 - **Multiple ASR engines**: faster-whisper, SenseVoice, FunASR Nano, Anime-Whisper
 - **Remote ASR**: offload speech recognition to a GPU machine over HTTP — see [REMOTE_ASR.md](REMOTE_ASR.md)
 - **Any OpenAI-compatible API**: DeepSeek, Grok, Qwen, GPT, Ollama, vLLM, etc.
@@ -111,10 +111,12 @@ Settings → Translation tab:
 Settings → VAD / ASR → Audio Preprocessing:
 
 - `Off` — preserves the original capture → VAD behavior.
-- `Demucs v4` — vocal/source separation using ~8 s windows; CUDA is strongly recommended.
-- `ClearerVoice / MossFormer2 SE` — speech enhancement using ~4 s windows; CUDA is strongly recommended.
+- `MDX-NET — Low latency` — `UVR-MDX-NET-Inst_HQ_3.onnx`, using ~1.5 s overlapping live windows.
+- `MelBand RoFormer — High quality` — `model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt`, using ~1.6 s overlapping live windows with the RoFormer internal segment size shortened to the live window.
 
-Optional preprocessing assets are downloaded from the existing model-download dialog. Demucs and ClearerVoice use isolated uv overlays under `.preprocess-envs/`: compatible packages such as PyTorch/Torchaudio are reused from the main environment, while missing or version-conflicting packages stay isolated. When enabled, the processed PCM is fed into VAD first, so VAD, ASR, translation, and every downstream stage all operate on the preprocessed audio.
+Optional preprocessing assets are downloaded from the existing model-download dialog. Both modes share one `audio-separator` model cache and one isolated uv overlay under `.preprocess-envs/`; compatible PyTorch dependencies are reused from the main environment where possible. The persistent worker calls the loaded model's in-memory `demix()` path instead of the file-oriented separation API, and the controller trims overlapping window edges before feeding vocals into VAD. A startup warmup/benchmark reports whether inference fits inside the real-time hop budget. CUDA is strongly recommended.
+
+The streaming scheme is adapted from [`nnyj/python-audio-separator-live`](https://github.com/nnyj/python-audio-separator-live) (MIT), integrated into LiveTranslate's existing WASAPI → VAD → ASR pipeline rather than using its device-routing layer.
 
 ## Architecture
 
@@ -127,7 +129,7 @@ Audio (WASAPI 32ms) → optional AudioPreprocessor → VAD (Silero) → ASR → 
 main.py                 Entry point & pipeline
 ├── audio_capture.py    WASAPI loopback + mic mix-in
 ├── audio_preprocessor.py Optional buffered preprocessing controller
-├── audio_preprocess_worker.py Isolated Demucs / ClearVoice worker
+├── audio_preprocess_worker.py Isolated MDX-NET / MelBand RoFormer live worker
 ├── vad_processor.py    Silero VAD
 ├── asr_engine.py       faster-whisper backend
 ├── asr_funasr.py       Unified FunASR model selector backend

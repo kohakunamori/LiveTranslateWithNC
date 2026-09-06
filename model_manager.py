@@ -79,28 +79,36 @@ PREPROCESS_MODELS_DIR = MODELS_DIR / "audio_preprocess"
 # preprocessing runtimes without copying multi-gigabyte virtual environments.
 # Values may point either to python.exe directly or to the environment root.
 _PREPROCESS_ENV_PYTHON_KEYS = {
-    "demucs_v4": "LIVETRANSLATE_DEMUCS_PYTHON",
-    "clearvoice_mossformer2_se": "LIVETRANSLATE_CLEARVOICE_PYTHON",
+    "mdx_net": "LIVETRANSLATE_AUDIO_SEPARATOR_PYTHON",
+    "melband_roformer": "LIVETRANSLATE_AUDIO_SEPARATOR_PYTHON",
 }
+
+_AUDIO_SEPARATOR_LIVE_MODES = ("mdx_net", "melband_roformer")
 
 PREPROCESSOR_PROFILES = {
     "off": {
         "display_name": "Off",
         "estimated_bytes": 0,
     },
-    "demucs_v4": {
-        "display_name": "Demucs v4",
-        "estimated_bytes": 85_000_000,
-        "runtime_estimated_bytes": 2_800_000_000,
-        "shared_runtime_estimated_bytes": 50_000_000,
-        "env": "demucs",
+    "mdx_net": {
+        "display_name": "MDX-NET (Low latency)",
+        "model_filename": "UVR-MDX-NET-Inst_HQ_3.onnx",
+        "min_model_bytes": 10_000_000,
+        "estimated_bytes": 75_000_000,
+        "runtime_estimated_bytes": 3_200_000_000,
+        "shared_runtime_estimated_bytes": 650_000_000,
+        "env": "audio-separator-live",
+        "model_subdir": "audio-separator-live",
     },
-    "clearvoice_mossformer2_se": {
-        "display_name": "ClearerVoice / MossFormer2 SE",
-        "estimated_bytes": 222_000_000,
-        "runtime_estimated_bytes": 2_900_000_000,
-        "shared_runtime_estimated_bytes": 500_000_000,
-        "env": "clearvoice",
+    "melband_roformer": {
+        "display_name": "MelBand RoFormer (High quality)",
+        "model_filename": "model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt",
+        "min_model_bytes": 900_000_000,
+        "estimated_bytes": 1_050_000_000,
+        "runtime_estimated_bytes": 3_200_000_000,
+        "shared_runtime_estimated_bytes": 650_000_000,
+        "env": "audio-separator-live",
+        "model_subdir": "audio-separator-live",
     },
 }
 
@@ -504,7 +512,16 @@ def audio_preprocessor_display_name(mode: str | None) -> str:
 
 def audio_preprocessor_model_dir(mode: str | None) -> Path:
     mode = normalize_audio_preprocess_mode(mode)
-    return PREPROCESS_MODELS_DIR / mode
+    profile = PREPROCESSOR_PROFILES[mode]
+    return PREPROCESS_MODELS_DIR / str(profile.get("model_subdir", mode))
+
+
+def audio_preprocessor_ready_marker(mode: str | None) -> Path:
+    mode = normalize_audio_preprocess_mode(mode)
+    model_dir = audio_preprocessor_model_dir(mode)
+    if mode in _AUDIO_SEPARATOR_LIVE_MODES:
+        return model_dir / f".ready-{mode}"
+    return model_dir / ".ready"
 
 
 def _external_audio_preprocessor_python(mode: str | None) -> Path | None:
@@ -597,19 +614,29 @@ def _audio_preprocessor_model_present(mode: str | None) -> bool:
     if mode == "off":
         return True
     model_dir = audio_preprocessor_model_dir(mode)
-    if mode == "demucs_v4":
+    if mode == "mdx_net":
+        profile = PREPROCESSOR_PROFILES[mode]
+        model = model_dir / profile["model_filename"]
+        mdx_data = model_dir / "mdx_model_data.json"
+        vr_data = model_dir / "vr_model_data.json"
         return (
-            (model_dir / "htdemucs.yaml").is_file()
-            and any(p.stat().st_size > 50_000_000 for p in model_dir.glob("*.th"))
+            model.is_file()
+            and model.stat().st_size > int(profile["min_model_bytes"])
+            and mdx_data.is_file()
+            and mdx_data.stat().st_size > 0
+            and vr_data.is_file()
+            and vr_data.stat().st_size > 0
         )
-    if mode == "clearvoice_mossformer2_se":
-        checkpoint = (
-            model_dir
-            / "checkpoints"
-            / "MossFormer2_SE_48K"
-            / "last_best_checkpoint.pt"
+    if mode == "melband_roformer":
+        profile = PREPROCESSOR_PROFILES[mode]
+        model = model_dir / profile["model_filename"]
+        yaml_file = model.with_suffix(".yaml")
+        return (
+            model.is_file()
+            and model.stat().st_size > int(profile["min_model_bytes"])
+            and yaml_file.is_file()
+            and yaml_file.stat().st_size > 0
         )
-        return checkpoint.is_file() and checkpoint.stat().st_size > 100_000_000
     return False
 
 
@@ -618,8 +645,7 @@ def is_audio_preprocessor_ready(mode: str | None) -> bool:
     if mode == "off":
         return True
 
-    model_dir = audio_preprocessor_model_dir(mode)
-    marker = model_dir / ".ready"
+    marker = audio_preprocessor_ready_marker(mode)
     if not marker.exists():
         return False
     if not _audio_preprocessor_model_present(mode):
@@ -628,7 +654,7 @@ def is_audio_preprocessor_ready(mode: str | None) -> bool:
     env_python = audio_preprocessor_env_python(mode)
     if env_python is None or not env_python.is_file():
         return False
-    return mode in ("demucs_v4", "clearvoice_mossformer2_se")
+    return mode in _AUDIO_SEPARATOR_LIVE_MODES
 
 
 def get_missing_audio_preprocessor(mode: str | None) -> list[dict]:
@@ -649,7 +675,7 @@ def get_missing_audio_preprocessor(mode: str | None) -> list[dict]:
             runtime_missing = not (PREPROCESS_ENVS_DIR / env_name / ".deps-ready").exists()
     if runtime_missing:
         runtime_estimated = int(profile.get("runtime_estimated_bytes", 0))
-        if mode in ("demucs_v4", "clearvoice_mossformer2_se") and _shared_torch_runtime() is not None:
+        if mode in _AUDIO_SEPARATOR_LIVE_MODES and _shared_torch_runtime() is not None:
             runtime_estimated = int(
                 profile.get("shared_runtime_estimated_bytes", runtime_estimated)
             )
@@ -892,22 +918,26 @@ def _install_shared_preprocessor_overlay(
         f"torchaudio={shared_torch['torchaudio']}, CUDA={cuda}"
     )
 
-    if mode == "demucs_v4":
-        requirements = ["demucs==4.1.0"]
+    if mode in _AUDIO_SEPARATOR_LIVE_MODES:
+        # ORT 1.27+ PyPI wheels switched to CUDA 13.0. LiveTranslate's current
+        # NVIDIA runtime is CUDA 12.8, so keep the GPU EP on the official
+        # CUDA-12.8-compatible ORT release line (1.21.x-1.26.x).
+        requirements = [
+            "audio-separator[gpu]==0.47.0",
+            "onnxruntime-gpu>=1.21,<1.27",
+            # audio-separator imports audioread directly, but its 0.47.0
+            # metadata does not guarantee that package is present when librosa
+            # is reused from LiveTranslate's main environment.
+            "audioread>=3,<4",
+        ]
         validate = (
-            "import torch, torchaudio; "
-            "from demucs.api import Separator; "
-            "import einops, julius, lameenc, sphn; "
-            "print('Demucs runtime ready: torch=' + torch.__version__ + "
-            "', torchaudio=' + torchaudio.__version__)"
-        )
-    elif mode == "clearvoice_mossformer2_se":
-        requirements = ["clearvoice==0.1.2"]
-        validate = (
-            "import torch, torchaudio, numpy, librosa, soundfile; "
-            "from clearvoice import ClearVoice; "
-            "print('ClearVoice runtime ready: torch=' + torch.__version__ + "
-            "', numpy=' + numpy.__version__ + ', librosa=' + librosa.__version__)"
+            "import torch, numpy, scipy, onnxruntime; "
+            "assert tuple(map(int, onnxruntime.__version__.split('.')[:2])) < (1,27), "
+            "'onnxruntime-gpu 1.27+ requires CUDA 13'; "
+            "from audio_separator.separator import Separator; "
+            "print('audio-separator live runtime ready: torch=' + torch.__version__ + "
+            "', onnxruntime=' + onnxruntime.__version__ + "
+            "', providers=' + ','.join(onnxruntime.get_available_providers()))"
         )
     else:
         raise ValueError(f"Unsupported shared overlay mode: {mode}")
@@ -974,7 +1004,7 @@ def _ensure_audio_preprocessor_env(mode: str) -> Path:
     if deps_marker.exists():
         return python
 
-    if mode in ("demucs_v4", "clearvoice_mossformer2_se"):
+    if mode in _AUDIO_SEPARATOR_LIVE_MODES:
         shared_torch = _shared_torch_runtime()
         if shared_torch is not None:
             _install_shared_preprocessor_overlay(mode, uv, env_dir, python, shared_torch)
@@ -1003,14 +1033,11 @@ def _ensure_audio_preprocessor_env(mode: str) -> Path:
         ],
         progress_label=f"Installing PyTorch runtime ({torch_index})",
     )
-    if mode == "demucs_v4":
-        packages = ["demucs==4.1.0"]
-    elif mode == "clearvoice_mossformer2_se":
+    if mode in _AUDIO_SEPARATOR_LIVE_MODES:
         packages = [
-            "clearvoice==0.1.2",
-            "numpy==1.26.4",
-            "librosa==0.10.2.post1",
-            "soundfile==0.12.1",
+            "audio-separator[gpu]==0.47.0",
+            "onnxruntime-gpu>=1.21,<1.27",
+            "audioread>=3,<4",
         ]
     else:
         packages = []
@@ -1031,42 +1058,40 @@ def download_audio_preprocessor(mode: str | None, proxy: str = "system") -> None
     profile = PREPROCESSOR_PROFILES[mode]
     model_dir = audio_preprocessor_model_dir(mode)
     model_dir.mkdir(parents=True, exist_ok=True)
-    marker = model_dir / ".ready"
+    marker = audio_preprocessor_ready_marker(mode)
+    reusable_model = marker.exists() and _audio_preprocessor_model_present(mode)
     marker.unlink(missing_ok=True)
 
     with _proxy_env(proxy):
-        if mode == "demucs_v4":
-            _ensure_audio_preprocessor_env(mode)
-            target = model_dir / "955717e8-8726e21a.th"
-            if not _audio_preprocessor_model_present(mode):
-                (model_dir / "htdemucs.yaml").write_text(
-                    "models: ['955717e8']\n", encoding="ascii"
-                )
-                _download_url(
-                    "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/"
-                    "955717e8-8726e21a.th",
-                    target,
-                    "Demucs v4 htdemucs model",
-                )
-            else:
-                log.info("Demucs v4 model already cached; reusing it")
-            if target.stat().st_size <= 50_000_000:
-                raise RuntimeError("Demucs model download is incomplete")
-
-        elif mode == "clearvoice_mossformer2_se":
-            python = _ensure_audio_preprocessor_env(mode)
-            if not _audio_preprocessor_model_present(mode):
-                log.info("Downloading ClearerVoice / MossFormer2 SE model...")
-                code = (
-                    "import os,sys; from pathlib import Path; "
-                    "root=Path(sys.argv[1]).resolve(); root.mkdir(parents=True, exist_ok=True); "
-                    "os.chdir(root); from clearvoice import ClearVoice; "
-                    "ClearVoice(task='speech_enhancement', model_names=['MossFormer2_SE_48K']); "
-                    "print('MossFormer2_SE_48K ready')"
-                )
-                _run_logged([str(python), "-c", code, str(model_dir)], cwd=APP_DIR)
-            else:
-                log.info("ClearerVoice / MossFormer2 SE model already cached; reusing it")
+        if mode not in _AUDIO_SEPARATOR_LIVE_MODES:
+            raise ValueError(f"Unsupported audio preprocessing mode: {mode}")
+        python = _ensure_audio_preprocessor_env(mode)
+        if not reusable_model:
+            model_filename = str(profile["model_filename"])
+            # audio-separator downloads directly to the final filename. If the
+            # process was interrupted, an incomplete .onnx/.ckpt can therefore
+            # remain. A model without our ready marker is never trusted/reused.
+            target = model_dir / model_filename
+            target.unlink(missing_ok=True)
+            if mode == "melband_roformer":
+                target.with_suffix(".yaml").unlink(missing_ok=True)
+            log.info(f"Downloading {profile['display_name']} model: {model_filename}")
+            code = (
+                "import logging,sys; "
+                "from pathlib import Path; "
+                "from audio_separator.separator import Separator; "
+                "root=Path(sys.argv[1]).resolve(); root.mkdir(parents=True, exist_ok=True); "
+                "sep=Separator(log_level=logging.INFO, model_file_dir=str(root), info_only=True); "
+                "sep.download_model_and_data(sys.argv[2]); "
+                "print('audio-separator model ready: ' + sys.argv[2])"
+            )
+            _run_logged(
+                [str(python), "-c", code, str(model_dir), model_filename],
+                cwd=APP_DIR,
+                progress_label=f"Downloading {profile['display_name']} model",
+            )
+        else:
+            log.info(f"{profile['display_name']} model already cached; reusing it")
 
     marker.write_text("ready\n", encoding="ascii")
     if not is_audio_preprocessor_ready(mode):

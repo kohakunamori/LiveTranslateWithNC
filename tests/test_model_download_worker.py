@@ -12,12 +12,12 @@ def test_download_worker_routes_preprocessor_to_model_manager(monkeypatch):
     )
 
     model_download_worker._download_one(
-        {"name": "Demucs v4", "type": "preprocess:demucs_v4"},
+        {"name": "MDX-NET", "type": "preprocess:mdx_net"},
         hub="hf",
         proxy="http://127.0.0.1:7890",
     )
 
-    assert calls == [("demucs_v4", "http://127.0.0.1:7890")]
+    assert calls == [("mdx_net", "http://127.0.0.1:7890")]
 
 
 def test_download_worker_routes_funasr_model_key(monkeypatch):

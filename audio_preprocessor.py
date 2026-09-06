@@ -21,12 +21,12 @@ from model_manager import (
 log = logging.getLogger("LiveTranslate.AudioPreprocess")
 APP_DIR = Path(__file__).parent
 
-# Keep windows aligned to the application's native 32 ms VAD chunks. Heavy
-# source-separation/enhancement models need enough context to amortize per-call
-# overhead, so they intentionally add a few seconds of latency.
-_WINDOW_CHUNKS = {
-    "demucs_v4": 250,  # 8.0 s; amortizes Demucs per-call overhead
-    "clearvoice_mossformer2_se": 125,  # 4.0 s
+# Keep streaming windows aligned to the application's native 32 ms VAD chunks.
+# python-audio-separator-live uses ~1.6 s windows and ~0.1 s overlap per edge;
+# keep MDX just above the upstream ~1.5 s quality floor and RoFormer at 1.6 s.
+_STREAM_CONFIG = {
+    "mdx_net": {"window_chunks": 47, "overlap_chunks": 3},  # 1.504 s
+    "melband_roformer": {"window_chunks": 50, "overlap_chunks": 3},  # 1.600 s
 }
 
 
@@ -45,10 +45,11 @@ def _read_exact(stream, size: int) -> bytes:
 class AudioPreprocessor:
     """Optional preprocessing stage inserted immediately before VAD.
 
-    The public interface always consumes/produces the same mono float32 chunks as
-    AudioCapture/VADProcessor. Heavy model dependencies live in isolated uv
-    environments and are hosted in a persistent subprocess so model weights load
-    once per mode switch instead of once per audio window.
+    Off mode preserves the historical mono float32 capture contract.  Music
+    modes consume native frame-major loopback PCM plus its sample rate, keep the
+    microphone as a 16 kHz sidecar, and always emit the same mono 16 kHz chunks
+    expected by VADProcessor. Heavy model dependencies live in an isolated uv
+    environment and a persistent subprocess so weights load once per mode switch.
     """
 
     def __init__(
@@ -62,9 +63,20 @@ class AudioPreprocessor:
         self.sample_rate = int(sample_rate)
         self.chunk_duration = float(chunk_duration)
         self.chunk_samples = max(1, round(self.sample_rate * self.chunk_duration))
-        self.window_chunks = _WINDOW_CHUNKS.get(self.mode, 1)
+        stream_config = _STREAM_CONFIG.get(
+            self.mode, {"window_chunks": 1, "overlap_chunks": 0}
+        )
+        self.window_chunks = int(stream_config["window_chunks"])
+        self.overlap_chunks = int(stream_config["overlap_chunks"])
+        self.hop_chunks = max(1, self.window_chunks - 2 * self.overlap_chunks)
         self.window_samples = self.chunk_samples * self.window_chunks
-        self._pending = np.empty(0, dtype=np.float32)
+        self.overlap_samples = self.chunk_samples * self.overlap_chunks
+        self.hop_samples = self.chunk_samples * self.hop_chunks
+        self._pending_native: list[np.ndarray] = []
+        self._pending_mic: list[np.ndarray] = []
+        self._input_rate: int | None = None
+        self._input_channels: int | None = None
+        self._has_scheduled_window = False
         self._proc: subprocess.Popen | None = None
         self._stderr_thread: threading.Thread | None = None
         self._processing_thread: threading.Thread | None = None
@@ -83,7 +95,7 @@ class AudioPreprocessor:
     def latency_seconds(self) -> float:
         if self.mode == "off":
             return 0.0
-        return self.window_samples / self.sample_rate
+        return self.window_chunks * self.chunk_duration
 
     @property
     def started(self) -> bool:
@@ -116,8 +128,10 @@ class AudioPreprocessor:
                     self.mode,
                     "--model-dir",
                     str(model_dir),
-                    "--sample-rate",
+                    "--target-sample-rate",
                     str(self.sample_rate),
+                    "--window-seconds",
+                    str(self.latency_seconds),
                 ],
                 cwd=str(APP_DIR),
                 stdin=subprocess.PIPE,
@@ -139,15 +153,46 @@ class AudioPreprocessor:
                     f"(exit={code})"
                 )
 
-            # Heavy backends pay a large one-time CUDA/kernel warm-up cost. Do it
-            # while the existing model-loading dialog is still visible instead of
-            # stalling the first live capture window.
-            if self.mode in ("demucs_v4", "clearvoice_mossformer2_se"):
-                warmup_samples = min(self.window_samples, self.sample_rate * 4)
-                t = np.arange(warmup_samples, dtype=np.float32) / self.sample_rate
-                warmup = (1e-4 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
+            # Pay CUDA/ORT kernel setup cost while the model-loading dialog is
+            # visible, then report whether one inference fits inside the streaming
+            # hop budget. This mirrors the upstream live separator's startup test.
+            if self.mode in _STREAM_CONFIG:
+                benchmark_rate = 44100
+                benchmark_frames = max(
+                    1, round(benchmark_rate * self.latency_seconds)
+                )
+                t = np.arange(benchmark_frames, dtype=np.float32) / benchmark_rate
+                tone = (1e-4 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
+                warmup = np.column_stack((tone, tone))
                 log.info(f"Warming up audio preprocessor: {self.display_name}")
-                self._request(warmup)
+                self._request(
+                    warmup,
+                    input_rate=benchmark_rate,
+                    output_samples=self.window_samples,
+                    warn_slow=False,
+                )
+                benchmark_start = time.perf_counter()
+                self._request(
+                    warmup,
+                    input_rate=benchmark_rate,
+                    output_samples=self.window_samples,
+                    warn_slow=False,
+                )
+                benchmark_elapsed = time.perf_counter() - benchmark_start
+                hop_seconds = self.hop_chunks * self.chunk_duration
+                rtf = benchmark_elapsed / max(hop_seconds, 1e-6)
+                log.info(
+                    f"Live separator benchmark: {self.display_name}, "
+                    f"window={self.latency_seconds:.3f}s, "
+                    f"hop={hop_seconds:.3f}s, inference={benchmark_elapsed:.3f}s, "
+                    f"hop-RTF={rtf:.2f}"
+                )
+                if benchmark_elapsed >= hop_seconds:
+                    log.warning(
+                        f"{self.display_name} cannot keep up with realtime at the "
+                        f"current window size (inference {benchmark_elapsed:.2f}s >= "
+                        f"hop {hop_seconds:.2f}s)"
+                    )
 
             self._worker_error = None
             self._processing_thread = threading.Thread(
@@ -170,9 +215,19 @@ class AudioPreprocessor:
             if text:
                 log.info(f"[{self.mode}] {text}")
 
-    def _request(self, samples: np.ndarray) -> np.ndarray:
+    def _request(
+        self,
+        samples: np.ndarray,
+        *,
+        input_rate: int,
+        output_samples: int,
+        warn_slow: bool = True,
+    ) -> np.ndarray:
         if self.mode == "off":
-            return np.asarray(samples, dtype=np.float32).copy()
+            mono = np.asarray(samples, dtype=np.float32)
+            if mono.ndim > 1:
+                mono = mono.mean(axis=1)
+            return np.asarray(mono, dtype=np.float32).reshape(-1).copy()
         self.start()
         proc = self._proc
         if proc is None or proc.stdin is None or proc.stdout is None:
@@ -181,15 +236,32 @@ class AudioPreprocessor:
             raise RuntimeError(
                 f"audio preprocessor worker exited unexpectedly: {proc.returncode}"
             )
-
+        samples = np.asarray(samples, dtype=np.float32)
+        if samples.ndim == 1:
+            samples = samples[:, None]
+        if samples.ndim != 2:
+            raise ValueError(f"native audio must be frame-major 2D PCM, got {samples.shape}")
+        frames, channels = samples.shape
+        if frames <= 0 or channels <= 0:
+            return np.zeros(max(0, int(output_samples)), dtype=np.float32)
         samples = np.ascontiguousarray(samples, dtype=np.float32)
+        input_rate = int(input_rate)
+        output_samples = max(1, int(output_samples))
         start = time.perf_counter()
         with self._io_lock:
             if proc.poll() is not None:
                 raise RuntimeError(
                     f"audio preprocessor worker exited unexpectedly: {proc.returncode}"
                 )
-            proc.stdin.write(struct.pack("<I", len(samples)))
+            proc.stdin.write(
+                struct.pack(
+                    "<IIII",
+                    int(frames * channels),
+                    input_rate,
+                    int(channels),
+                    output_samples,
+                )
+            )
             proc.stdin.write(samples.tobytes())
             proc.stdin.flush()
             header = _read_exact(proc.stdout, 4)
@@ -199,22 +271,27 @@ class AudioPreprocessor:
             payload = _read_exact(proc.stdout, count * 4)
         output = np.frombuffer(payload, dtype=np.float32).copy()
         elapsed = time.perf_counter() - start
-        duration = len(samples) / self.sample_rate
+        duration = frames / max(input_rate, 1)
         rtf = elapsed / duration if duration else 0.0
         log.debug(
             f"Audio preprocess {self.mode}: {duration:.2f}s -> {elapsed:.2f}s "
             f"(RTF={rtf:.2f})"
         )
-        if elapsed > duration:
+        realtime_budget = (
+            self.hop_chunks * self.chunk_duration
+            if self.mode in _STREAM_CONFIG
+            else duration
+        )
+        if warn_slow and elapsed > realtime_budget:
             log.warning(
                 f"Audio preprocessor slower than realtime: {self.display_name}, "
-                f"RTF={rtf:.2f}"
+                f"inference={elapsed:.2f}s > hop budget={realtime_budget:.2f}s"
             )
-        if len(output) != len(samples):
-            if len(output) > len(samples):
-                output = output[: len(samples)]
+        if len(output) != output_samples:
+            if len(output) > output_samples:
+                output = output[:output_samples]
             else:
-                output = np.pad(output, (0, len(samples) - len(output)))
+                output = np.pad(output, (0, output_samples - len(output)))
         return output.astype(np.float32, copy=False)
 
     def _processing_loop(self) -> None:
@@ -223,9 +300,24 @@ class AudioPreprocessor:
             try:
                 if item is None:
                     return
-                generation, block, valid_samples = item
-                processed = self._request(block)
-                self._output_queue.put((generation, processed, valid_samples))
+                (
+                    generation,
+                    block,
+                    input_rate,
+                    mic_block,
+                    output_start,
+                    output_end,
+                ) = item
+                processed = self._request(
+                    block,
+                    input_rate=input_rate,
+                    output_samples=len(mic_block),
+                )
+                selected = (
+                    processed[int(output_start) : int(output_end)]
+                    + mic_block[int(output_start) : int(output_end)]
+                )
+                self._output_queue.put((generation, selected))
             except Exception as exc:
                 self._worker_error = exc
                 log.error(
@@ -250,14 +342,20 @@ class AudioPreprocessor:
     def _enqueue_block(
         self,
         block: np.ndarray,
-        valid_samples: int,
+        input_rate: int,
+        mic_block: np.ndarray,
+        output_start: int,
+        output_end: int,
         *,
         wait: bool = False,
     ) -> None:
         item = (
             self._generation,
             np.ascontiguousarray(block, dtype=np.float32),
-            int(valid_samples),
+            int(input_rate),
+            np.ascontiguousarray(mic_block, dtype=np.float32).reshape(-1),
+            int(output_start),
+            int(output_end),
         )
         if wait:
             self._input_queue.put(item)
@@ -287,14 +385,12 @@ class AudioPreprocessor:
         output_chunks: list[np.ndarray] = []
         while True:
             try:
-                generation, processed, valid_samples = self._output_queue.get_nowait()
+                generation, processed = self._output_queue.get_nowait()
             except queue.Empty:
                 break
             if generation != self._generation:
                 continue
-            output_chunks.extend(
-                self._split_chunks(processed, valid_samples=valid_samples)
-            )
+            output_chunks.extend(self._split_chunks(processed))
         return output_chunks
 
     def _raise_worker_error(self) -> None:
@@ -305,9 +401,7 @@ class AudioPreprocessor:
                 f"{self.display_name} preprocessing worker failed: {exc}"
             ) from exc
 
-    def _split_chunks(self, samples: np.ndarray, valid_samples: int | None = None):
-        if valid_samples is not None:
-            samples = samples[:valid_samples]
+    def _split_chunks(self, samples: np.ndarray):
         chunks = []
         for start in range(0, len(samples), self.chunk_samples):
             chunk = samples[start : start + self.chunk_samples]
@@ -316,26 +410,87 @@ class AudioPreprocessor:
             chunks.append(np.asarray(chunk, dtype=np.float32))
         return chunks
 
-    def process_chunk(self, chunk: np.ndarray) -> list[np.ndarray]:
-        chunk = np.asarray(chunk, dtype=np.float32).reshape(-1)
+    def _fit_mic_chunk(self, mic_chunk: np.ndarray | None) -> np.ndarray:
+        if mic_chunk is None:
+            return np.zeros(self.chunk_samples, dtype=np.float32)
+        mic = np.asarray(mic_chunk, dtype=np.float32).reshape(-1)
+        if len(mic) > self.chunk_samples:
+            return mic[: self.chunk_samples].copy()
+        if len(mic) < self.chunk_samples:
+            return np.pad(mic, (0, self.chunk_samples - len(mic))).astype(np.float32)
+        return mic.copy()
+
+    def _clear_pending_locked(self) -> None:
+        self._pending_native.clear()
+        self._pending_mic.clear()
+        self._input_rate = None
+        self._input_channels = None
+        self._has_scheduled_window = False
+
+    def process_chunk(
+        self,
+        chunk: np.ndarray,
+        *,
+        input_rate: int | None = None,
+        mic_chunk: np.ndarray | None = None,
+    ) -> list[np.ndarray]:
+        chunk = np.asarray(chunk, dtype=np.float32)
         if self.mode == "off":
-            return [chunk]
+            return [chunk.reshape(-1)]
         self.start()
         self._raise_worker_error()
-        if len(chunk) != self.chunk_samples:
-            # AudioCapture normally produces exact chunks; normalize unusual tail
-            # chunks so the worker/VAD boundary remains deterministic.
-            if len(chunk) > self.chunk_samples:
-                chunk = chunk[: self.chunk_samples]
-            else:
-                chunk = np.pad(chunk, (0, self.chunk_samples - len(chunk)))
+        if input_rate is None or int(input_rate) <= 0:
+            raise ValueError("music preprocessing requires the native input sample rate")
+        input_rate = int(input_rate)
+        if chunk.ndim == 1:
+            chunk = chunk[:, None]
+        if chunk.ndim != 2 or chunk.shape[0] == 0 or chunk.shape[1] == 0:
+            raise ValueError(f"music preprocessing requires frame-major native PCM, got {chunk.shape}")
+        chunk = np.ascontiguousarray(chunk, dtype=np.float32)
+        mic = self._fit_mic_chunk(mic_chunk)
 
         with self._lock:
-            self._pending = np.concatenate((self._pending, chunk))
-            while len(self._pending) >= self.window_samples:
-                block = self._pending[: self.window_samples].copy()
-                self._pending = self._pending[self.window_samples :]
-                self._enqueue_block(block, len(block))
+            channels = int(chunk.shape[1])
+            if self._input_rate is None:
+                self._input_rate = input_rate
+                self._input_channels = channels
+            elif self._input_rate != input_rate or self._input_channels != channels:
+                log.info(
+                    "Native audio format changed; resetting separator overlap state: "
+                    f"{self._input_rate}Hz/{self._input_channels}ch -> "
+                    f"{input_rate}Hz/{channels}ch"
+                )
+                self._generation += 1
+                self._clear_pending_locked()
+                self._input_rate = input_rate
+                self._input_channels = channels
+
+            self._pending_native.append(chunk)
+            self._pending_mic.append(mic)
+            while len(self._pending_native) >= self.window_chunks:
+                block = np.concatenate(
+                    self._pending_native[: self.window_chunks], axis=0
+                )
+                mic_block = np.concatenate(
+                    self._pending_mic[: self.window_chunks], axis=0
+                )
+                if self._has_scheduled_window:
+                    output_start = self.overlap_samples
+                else:
+                    # Preserve the start of the stream; only the right edge needs
+                    # to be held for the next overlapping window.
+                    output_start = 0
+                output_end = self.window_samples - self.overlap_samples
+                del self._pending_native[: self.hop_chunks]
+                del self._pending_mic[: self.hop_chunks]
+                self._enqueue_block(
+                    block,
+                    input_rate,
+                    mic_block,
+                    output_start,
+                    output_end,
+                )
+                self._has_scheduled_window = True
         return self._drain_output()
 
     def flush(self) -> list[np.ndarray]:
@@ -343,12 +498,46 @@ class AudioPreprocessor:
             return []
         self.start()
         self._raise_worker_error()
+        block = None
+        mic_block = None
+        input_rate = None
+        output_start = 0
+        output_end = 0
         with self._lock:
-            if len(self._pending):
-                valid = len(self._pending)
-                block = np.pad(self._pending, (0, self.window_samples - valid))
-                self._pending = np.empty(0, dtype=np.float32)
-                self._enqueue_block(block, valid, wait=True)
+            if self._pending_native:
+                valid_chunks = len(self._pending_native)
+                input_rate = int(self._input_rate or 44100)
+                channels = int(self._input_channels or 2)
+                if self._has_scheduled_window:
+                    output_start = self.overlap_samples
+                else:
+                    output_start = 0
+                output_end = valid_chunks * self.chunk_samples
+                if output_end > output_start:
+                    native_chunks = list(self._pending_native)
+                    mic_chunks = list(self._pending_mic)
+                    missing = self.window_chunks - valid_chunks
+                    native_frames = max(1, round(input_rate * self.chunk_duration))
+                    for _ in range(max(0, missing)):
+                        native_chunks.append(
+                            np.zeros((native_frames, channels), dtype=np.float32)
+                        )
+                        mic_chunks.append(
+                            np.zeros(self.chunk_samples, dtype=np.float32)
+                        )
+                    block = np.concatenate(native_chunks[: self.window_chunks], axis=0)
+                    mic_block = np.concatenate(mic_chunks[: self.window_chunks], axis=0)
+                self._clear_pending_locked()
+        if block is not None:
+            assert mic_block is not None and input_rate is not None
+            self._enqueue_block(
+                block,
+                input_rate,
+                mic_block,
+                output_start,
+                output_end,
+                wait=True,
+            )
         self._input_queue.join()
         self._raise_worker_error()
         return self._drain_output()
@@ -356,7 +545,7 @@ class AudioPreprocessor:
     def reset(self) -> None:
         with self._lock:
             self._generation += 1
-            self._pending = np.empty(0, dtype=np.float32)
+            self._clear_pending_locked()
             while True:
                 try:
                     item = self._input_queue.get_nowait()
@@ -376,7 +565,7 @@ class AudioPreprocessor:
     def close(self) -> None:
         with self._lock:
             self._generation += 1
-            self._pending = np.empty(0, dtype=np.float32)
+            self._clear_pending_locked()
             proc = self._proc
             if proc is None:
                 return
@@ -405,7 +594,7 @@ class AudioPreprocessor:
                 self._io_lock.release()
         elif proc.poll() is None:
             # Mode switches must not block the Qt thread behind a multi-second
-            # Demucs/ClearVoice request. Killing the isolated worker is safe.
+            # Live separator request. Killing the isolated worker is safe.
             proc.kill()
 
         try:

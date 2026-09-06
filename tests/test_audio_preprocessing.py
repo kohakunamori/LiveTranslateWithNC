@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 import yaml
 
+import audio_preprocess_worker
 import model_manager
 from audio_preprocessor import AudioPreprocessor
 
@@ -20,9 +21,29 @@ def test_audio_preprocessing_defaults_to_off():
 def test_supported_audio_preprocessing_modes_are_registered():
     assert set(model_manager.PREPROCESSOR_PROFILES) == {
         "off",
-        "demucs_v4",
-        "clearvoice_mossformer2_se",
+        "mdx_net",
+        "melband_roformer",
     }
+    assert (
+        model_manager.PREPROCESSOR_PROFILES["mdx_net"]["model_filename"]
+        == "UVR-MDX-NET-Inst_HQ_3.onnx"
+    )
+    assert (
+        model_manager.PREPROCESSOR_PROFILES["melband_roformer"]["model_filename"]
+        == "model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt"
+    )
+
+
+def test_live_separator_modes_share_runtime_and_model_cache():
+    assert model_manager.audio_preprocessor_model_dir(
+        "mdx_net"
+    ) == model_manager.audio_preprocessor_model_dir("melband_roformer")
+    assert model_manager.audio_preprocessor_env_python(
+        "mdx_net"
+    ) == model_manager.audio_preprocessor_env_python("melband_roformer")
+    assert model_manager.audio_preprocessor_ready_marker(
+        "mdx_net"
+    ) != model_manager.audio_preprocessor_ready_marker("melband_roformer")
 
 
 def test_off_mode_preserves_capture_pcm_contract():
@@ -36,43 +57,81 @@ def test_off_mode_preserves_capture_pcm_contract():
     assert output[0].dtype == np.float32
 
 
-@pytest.mark.parametrize(
-    "mode", ["demucs_v4", "clearvoice_mossformer2_se"]
-)
-def test_buffered_preprocessor_returns_original_32ms_chunk_shape(monkeypatch, mode):
-    """Exercise buffering/async scheduling without loading an external model."""
+@pytest.mark.parametrize("mode", ["mdx_net", "melband_roformer"])
+def test_streaming_overlap_preserves_pcm_timeline(monkeypatch, mode):
+    """Exercise live overlap scheduling without loading an external model."""
     preprocessor = AudioPreprocessor(mode, sample_rate=16000, chunk_duration=0.032)
     monkeypatch.setattr(preprocessor, "start", lambda: None)
     monkeypatch.setattr(
         preprocessor,
         "_request",
-        lambda samples: np.asarray(samples, dtype=np.float32) * np.float32(0.5),
+        lambda samples, *, input_rate, output_samples: np.asarray(
+            samples, dtype=np.float32
+        )[:, 0][::3][:output_samples]
+        * np.float32(0.5),
     )
     preprocessor._processing_thread = threading.Thread(
         target=preprocessor._processing_loop, daemon=True
     )
     preprocessor._processing_thread.start()
 
+    source_count = preprocessor.window_chunks + preprocessor.hop_chunks + 5
     source_chunks = [
-        np.full(512, i / 100.0, dtype=np.float32)
-        for i in range(preprocessor.window_chunks)
+        np.full((1536, 2), (i + 1) / 100.0, dtype=np.float32)
+        for i in range(source_count)
     ]
+    mic_chunks = [np.full(512, 0.01, dtype=np.float32) for _ in range(source_count)]
     output_chunks = []
-    for chunk in source_chunks:
-        output_chunks.extend(preprocessor.process_chunk(chunk))
+    for chunk, mic in zip(source_chunks, mic_chunks):
+        output_chunks.extend(
+            preprocessor.process_chunk(chunk, input_rate=48000, mic_chunk=mic)
+        )
     output_chunks.extend(preprocessor.flush())
 
-    assert len(output_chunks) == preprocessor.window_chunks
+    assert len(output_chunks) == len(source_chunks)
     assert all(chunk.shape == (512,) for chunk in output_chunks)
     assert all(chunk.dtype == np.float32 for chunk in output_chunks)
     np.testing.assert_allclose(
         np.concatenate(output_chunks),
-        np.concatenate(source_chunks) * np.float32(0.5),
+        np.concatenate(
+            [np.full(512, (i + 1) / 200.0 + 0.01, dtype=np.float32) for i in range(source_count)]
+        ),
+        atol=1e-7,
     )
 
     preprocessor._input_queue.put(None)
     preprocessor._processing_thread.join(timeout=2)
     assert not preprocessor._processing_thread.is_alive()
+
+
+def test_short_stream_flushes_without_waiting_for_full_window(monkeypatch):
+    preprocessor = AudioPreprocessor("mdx_net", sample_rate=16000, chunk_duration=0.032)
+    monkeypatch.setattr(preprocessor, "start", lambda: None)
+    monkeypatch.setattr(
+        preprocessor,
+        "_request",
+        lambda samples, *, input_rate, output_samples: np.asarray(
+            samples, dtype=np.float32
+        )[:, 0][::3][:output_samples],
+    )
+    preprocessor._processing_thread = threading.Thread(
+        target=preprocessor._processing_loop, daemon=True
+    )
+    preprocessor._processing_thread.start()
+
+    chunks = [np.full((1536, 2), i + 1, dtype=np.float32) for i in range(7)]
+    for chunk in chunks:
+        assert preprocessor.process_chunk(chunk, input_rate=48000) == []
+    output = preprocessor.flush()
+
+    assert len(output) == len(chunks)
+    np.testing.assert_array_equal(
+        np.concatenate(output),
+        np.concatenate([np.full(512, i + 1, dtype=np.float32) for i in range(7)]),
+    )
+
+    preprocessor._input_queue.put(None)
+    preprocessor._processing_thread.join(timeout=2)
 
 
 def test_main_pipeline_preprocesses_before_vad():
@@ -85,66 +144,80 @@ def test_main_pipeline_preprocesses_before_vad():
     )[0]
 
     assert "self._audio_preprocessor.process_chunk(chunk)" in capture_loop
+    assert "item.loopback_native" in capture_loop
+    assert "input_rate=item.loopback_rate" in capture_loop
+    assert "mic_chunk=item.mic_mono" in capture_loop
     assert "self._audio_preprocessor.flush()" in capture_loop
     assert "self._vad.process_chunk(chunk)" not in capture_loop
     assert "self._vad.process_chunk(chunk)" in vad_helper
 
 
-def test_clearvoice_ready_requires_real_checkpoint_and_runtime(monkeypatch, tmp_path):
+def test_live_models_require_real_model_files_and_shared_runtime(monkeypatch, tmp_path):
     model_root = tmp_path / "models"
     env_root = tmp_path / "envs"
     monkeypatch.setattr(model_manager, "PREPROCESS_MODELS_DIR", model_root)
     monkeypatch.setattr(model_manager, "PREPROCESS_ENVS_DIR", env_root)
+    monkeypatch.setitem(
+        model_manager.PREPROCESSOR_PROFILES["mdx_net"], "min_model_bytes", 8
+    )
+    monkeypatch.setitem(
+        model_manager.PREPROCESSOR_PROFILES["melband_roformer"],
+        "min_model_bytes",
+        8,
+    )
 
-    model_dir = model_root / "clearvoice_mossformer2_se"
+    model_dir = model_root / "audio-separator-live"
     model_dir.mkdir(parents=True)
-    (model_dir / ".ready").write_text("ready\n", encoding="ascii")
-    python = env_root / "clearvoice" / "Scripts" / "python.exe"
+    python = env_root / "audio-separator-live" / "Scripts" / "python.exe"
     python.parent.mkdir(parents=True)
     python.write_bytes(b"test")
 
-    # ClearVoice itself may silently continue after a failed download. Our
-    # readiness gate must never accept that state without a real checkpoint.
-    assert not model_manager.is_audio_preprocessor_ready(
-        "clearvoice_mossformer2_se"
+    mdx_marker = model_manager.audio_preprocessor_ready_marker("mdx_net")
+    mdx_marker.write_text("ready\n", encoding="ascii")
+    assert not model_manager.is_audio_preprocessor_ready("mdx_net")
+    (model_dir / "UVR-MDX-NET-Inst_HQ_3.onnx").write_bytes(b"123456789")
+    assert not model_manager.is_audio_preprocessor_ready("mdx_net")
+    (model_dir / "mdx_model_data.json").write_text("{}\n", encoding="utf-8")
+    (model_dir / "vr_model_data.json").write_text("{}\n", encoding="utf-8")
+    assert model_manager.is_audio_preprocessor_ready("mdx_net")
+
+    mel_marker = model_manager.audio_preprocessor_ready_marker("melband_roformer")
+    mel_marker.write_text("ready\n", encoding="ascii")
+    assert not model_manager.is_audio_preprocessor_ready("melband_roformer")
+    (model_dir / "model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt").write_bytes(b"123456789")
+    (model_dir / "model_mel_band_roformer_ep_3005_sdr_11.4360.yaml").write_text(
+        "audio: {}\n", encoding="utf-8"
     )
-
-    checkpoint = (
-        model_dir
-        / "checkpoints"
-        / "MossFormer2_SE_48K"
-        / "last_best_checkpoint.pt"
-    )
-    checkpoint.parent.mkdir(parents=True)
-    with checkpoint.open("wb") as handle:
-        handle.seek(100_000_001)
-        handle.write(b"\0")
-
-    assert model_manager.is_audio_preprocessor_ready("clearvoice_mossformer2_se")
+    assert model_manager.is_audio_preprocessor_ready("melband_roformer")
 
 
-
-def test_external_preprocessor_runtime_can_be_reused(monkeypatch, tmp_path):
-    shared_env = tmp_path / "shared-demucs"
+def test_external_audio_separator_runtime_can_be_reused_by_both_modes(
+    monkeypatch, tmp_path
+):
+    shared_env = tmp_path / "shared-audio-separator"
     python = shared_env / "Scripts" / "python.exe"
     python.parent.mkdir(parents=True)
     python.write_bytes(b"stub")
 
-    monkeypatch.setenv("LIVETRANSLATE_DEMUCS_PYTHON", str(shared_env))
+    monkeypatch.setenv("LIVETRANSLATE_AUDIO_SEPARATOR_PYTHON", str(shared_env))
 
-    assert model_manager.audio_preprocessor_env_python("demucs_v4") == python
-    assert model_manager._ensure_audio_preprocessor_env("demucs_v4") == python
+    assert model_manager.audio_preprocessor_env_python("mdx_net") == python
+    assert model_manager.audio_preprocessor_env_python("melband_roformer") == python
+    assert model_manager._ensure_audio_preprocessor_env("mdx_net") == python
+    assert model_manager._ensure_audio_preprocessor_env("melband_roformer") == python
 
 
-def test_demucs_runtime_reuses_main_torch_without_installing_torch(monkeypatch, tmp_path):
+def test_audio_separator_runtime_reuses_main_torch_without_installing_torch(
+    monkeypatch, tmp_path
+):
     env_root = tmp_path / "envs"
-    env_dir = env_root / "demucs"
+    env_dir = env_root / "audio-separator-live"
     python = env_dir / "Scripts" / "python.exe"
     main_site = tmp_path / "main" / "Lib" / "site-packages"
     main_site.mkdir(parents=True)
     commands = []
 
-    monkeypatch.delenv("LIVETRANSLATE_DEMUCS_PYTHON", raising=False)
+    monkeypatch.delenv("LIVETRANSLATE_AUDIO_SEPARATOR_PYTHON", raising=False)
     monkeypatch.setattr(model_manager, "PREPROCESS_ENVS_DIR", env_root)
     monkeypatch.setattr(model_manager, "_uv_executable", lambda: "uv")
     monkeypatch.setattr(
@@ -155,18 +228,16 @@ def test_demucs_runtime_reuses_main_torch_without_installing_torch(monkeypatch, 
             "site_packages": main_site,
             "torch": "2.11.0+cu128",
             "torchaudio": "2.11.0+cu128",
-            "cuda": "12.8",
+            "cuda": "cu128",
         },
     )
     monkeypatch.setattr(
         model_manager,
         "_resolve_shared_overlay_packages",
         lambda *args, **kwargs: [
-            "demucs==4.1.0",
-            "einops==0.8.2",
-            "julius==0.2.8",
-            "lameenc==1.8.4",
-            "sphn==0.2.1",
+            "audio-separator==0.47.0",
+            "onnxruntime-gpu==1.23.0",
+            "numpy==2.3.0",
         ],
     )
 
@@ -178,8 +249,9 @@ def test_demucs_runtime_reuses_main_torch_without_installing_torch(monkeypatch, 
 
     monkeypatch.setattr(model_manager, "_run_logged", fake_run_logged)
 
-    assert model_manager._ensure_audio_preprocessor_env("demucs_v4") == python
+    assert model_manager._ensure_audio_preprocessor_env("mdx_net") == python
     assert (env_dir / ".deps-ready").read_text(encoding="ascii") == "shared-main-runtime\n"
+    assert model_manager._ensure_audio_preprocessor_env("melband_roformer") == python
 
     pth = env_dir / "Lib" / "site-packages" / "livetranslate-main-runtime.pth"
     assert pth.is_file()
@@ -189,13 +261,13 @@ def test_demucs_runtime_reuses_main_torch_without_installing_torch(monkeypatch, 
     assert len(install_commands) == 1
     install_cmd = install_commands[0]
     assert "--no-deps" in install_cmd
-    assert "demucs==4.1.0" in install_cmd
-    assert "torch==2.8.0" not in install_cmd
-    assert "torchaudio==2.8.0" not in install_cmd
+    assert "audio-separator==0.47.0" in install_cmd
+    assert not any(arg.startswith("torch==") for arg in install_cmd)
+    assert not any(arg.startswith("torchaudio==") for arg in install_cmd)
 
 
-def test_demucs_missing_size_uses_shared_runtime_estimate(monkeypatch, tmp_path):
-    monkeypatch.delenv("LIVETRANSLATE_DEMUCS_PYTHON", raising=False)
+def test_missing_size_uses_shared_runtime_estimate(monkeypatch, tmp_path):
+    monkeypatch.delenv("LIVETRANSLATE_AUDIO_SEPARATOR_PYTHON", raising=False)
     monkeypatch.setattr(model_manager, "PREPROCESS_MODELS_DIR", tmp_path / "models")
     monkeypatch.setattr(model_manager, "PREPROCESS_ENVS_DIR", tmp_path / "envs")
     monkeypatch.setattr(
@@ -204,70 +276,130 @@ def test_demucs_missing_size_uses_shared_runtime_estimate(monkeypatch, tmp_path)
         lambda: {"torch": "2.11.0+cu128"},
     )
 
-    missing = model_manager.get_missing_audio_preprocessor("demucs_v4")
+    missing = model_manager.get_missing_audio_preprocessor("mdx_net")
+    profile = model_manager.PREPROCESSOR_PROFILES["mdx_net"]
     assert len(missing) == 1
-    assert missing[0]["estimated_bytes"] == 85_000_000 + 50_000_000
+    assert missing[0]["estimated_bytes"] == (
+        profile["estimated_bytes"] + profile["shared_runtime_estimated_bytes"]
+    )
 
 
-def test_clearvoice_shared_runtime_keeps_conflicting_packages_in_overlay(monkeypatch, tmp_path):
+def test_mdx_primary_instrumental_is_converted_to_vocals_residual():
+    class FakeMdx:
+        primary_stem_name = "Instrumental"
+        compensate = 1.0
+
+        def demix(self, mix):
+            return mix * np.float32(0.75)
+
+    mix = np.full((2, 100), 0.8, dtype=np.float32)
+    vocals = audio_preprocess_worker.AudioSeparatorLiveBackend._vocals_from_demix(
+        FakeMdx(), mix
+    )
+    np.testing.assert_allclose(vocals, mix * np.float32(0.25))
+
+
+def test_roformer_vocals_dict_is_selected_directly():
+    class FakeRoformer:
+        def demix(self, mix):
+            return {
+                "vocals": np.full_like(mix, 0.2),
+                "other": np.full_like(mix, 0.8),
+            }
+
+    mix = np.ones((2, 100), dtype=np.float32)
+    vocals = audio_preprocess_worker.AudioSeparatorLiveBackend._vocals_from_demix(
+        FakeRoformer(), mix
+    )
+    np.testing.assert_allclose(vocals, 0.2)
+
+
+def test_worker_preserves_native_stereo_until_demix():
+    class FakeModel:
+        primary_stem_name = "vocals"
+
+        def __init__(self):
+            self.seen = None
+
+        def demix(self, mix):
+            self.seen = np.asarray(mix, dtype=np.float32).copy()
+            return self.seen
+
+    backend = object.__new__(audio_preprocess_worker.AudioSeparatorLiveBackend)
+    backend.target_sample_rate = 44100
+    backend.model = FakeModel()
+
+    native = np.column_stack(
+        (
+            np.full(256, 0.1, dtype=np.float32),
+            np.full(256, 0.3, dtype=np.float32),
+        )
+    )
+    output = backend.process(native, input_rate=44100, output_samples=256)
+
+    assert backend.model.seen.shape == (2, 256)
+    np.testing.assert_allclose(backend.model.seen[0], 0.1)
+    np.testing.assert_allclose(backend.model.seen[1], 0.3)
+    np.testing.assert_allclose(output, 0.2)
+
+
+def test_markerless_partial_model_is_replaced_before_download(monkeypatch, tmp_path):
+    model_root = tmp_path / "models"
     env_root = tmp_path / "envs"
-    env_dir = env_root / "clearvoice"
-    python = env_dir / "Scripts" / "python.exe"
-    main_site = tmp_path / "main" / "Lib" / "site-packages"
-    main_site.mkdir(parents=True)
-    commands = []
+    model_dir = model_root / "audio-separator-live"
+    model_dir.mkdir(parents=True)
+    target = model_dir / "UVR-MDX-NET-Inst_HQ_3.onnx"
+    target.write_bytes(b"partial-data")
 
-    monkeypatch.delenv("LIVETRANSLATE_CLEARVOICE_PYTHON", raising=False)
+    fake_python = env_root / "audio-separator-live" / "Scripts" / "python.exe"
+    fake_python.parent.mkdir(parents=True)
+    fake_python.write_bytes(b"stub")
+
+    monkeypatch.setattr(model_manager, "PREPROCESS_MODELS_DIR", model_root)
     monkeypatch.setattr(model_manager, "PREPROCESS_ENVS_DIR", env_root)
-    monkeypatch.setattr(model_manager, "_uv_executable", lambda: "uv")
-    monkeypatch.setattr(
-        model_manager,
-        "_shared_torch_runtime",
-        lambda: {
-            "python": tmp_path / "main" / "Scripts" / "python.exe",
-            "site_packages": main_site,
-            "torch": "2.11.0+cu128",
-            "torchaudio": "2.11.0+cu128",
-            "cuda": "12.8",
-        },
+    monkeypatch.setitem(
+        model_manager.PREPROCESSOR_PROFILES["mdx_net"], "min_model_bytes", 8
     )
     monkeypatch.setattr(
-        model_manager,
-        "_resolve_shared_overlay_packages",
-        lambda *args, **kwargs: [
-            "clearvoice==0.1.2",
-            "numpy==1.26.4",
-            "librosa==0.10.2.post1",
-            "soundfile==0.12.1",
-        ],
+        model_manager, "_ensure_audio_preprocessor_env", lambda mode: fake_python
+    )
+    monkeypatch.setattr(
+        model_manager, "audio_preprocessor_env_python", lambda mode: fake_python
     )
 
     def fake_run_logged(cmd, **kwargs):
-        commands.append((list(cmd), kwargs))
-        if len(cmd) > 1 and cmd[1] == "venv":
-            python.parent.mkdir(parents=True, exist_ok=True)
-            python.write_bytes(b"stub")
+        assert not target.exists(), "markerless partial must be deleted first"
+        target.write_bytes(b"complete-model")
+        (model_dir / "mdx_model_data.json").write_text("{}\n", encoding="utf-8")
+        (model_dir / "vr_model_data.json").write_text("{}\n", encoding="utf-8")
 
     monkeypatch.setattr(model_manager, "_run_logged", fake_run_logged)
+    monkeypatch.setattr(model_manager.shutil, "rmtree", lambda *args, **kwargs: None)
 
-    assert model_manager._ensure_audio_preprocessor_env("clearvoice_mossformer2_se") == python
-    install_commands = [cmd for cmd, _ in commands if "install" in cmd]
-    assert len(install_commands) == 1
-    install_cmd = install_commands[0]
-    assert "--no-deps" in install_cmd
-    assert "torch==2.8.0" not in install_cmd
-    assert "numpy==1.26.4" in install_cmd
-    assert "librosa==0.10.2.post1" in install_cmd
-    assert "soundfile==0.12.1" in install_cmd
+    model_manager.download_audio_preprocessor("mdx_net")
+
+    assert target.read_bytes() == b"complete-model"
+    assert model_manager.audio_preprocessor_ready_marker("mdx_net").is_file()
 
 
-def test_optional_heavy_runtimes_are_uv_managed():
+def test_optional_live_separator_runtime_is_uv_managed():
     requirements = Path("requirements.txt").read_text(encoding="utf-8").lower()
     manager = Path("model_manager.py").read_text(encoding="utf-8")
+    worker = Path("audio_preprocess_worker.py").read_text(encoding="utf-8")
 
     assert "uv>=0.8,<1.0" in requirements
     assert 'PREPROCESS_ENVS_DIR = APP_DIR / ".preprocess-envs"' in manager
-    assert 'packages = ["demucs==4.1.0"]' in manager
+    assert '"audio-separator[gpu]==0.47.0"' in manager
+    assert '"onnxruntime-gpu>=1.21,<1.27"' in manager
+    assert '"segment_size": 256' in worker
+    assert '"overlap": 0.0' in worker
+    assert '"cudnn_conv_algo_search": "HEURISTIC"' in worker
+    assert "download_model_files = _local_model_files" in worker
+    assert "actual_ort_providers" in worker
+    dependency_lines = [
+        line.strip().lower()
+        for line in requirements.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert not any(line.startswith("audio-separator") for line in dependency_lines)
     assert '"rnnoise"' not in manager.lower()
-    assert "audio-separator" not in manager
-    assert '"clearvoice==0.1.2"' in manager

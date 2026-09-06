@@ -36,7 +36,7 @@ huggingface_hub>=0.20.0
 
 # Optional audio preprocessing runtimes are isolated under .preprocess-envs/.
 # The app uses uv to create/sync those environments on demand from the model
-# download dialog instead of mixing Demucs/ClearVoice dependencies into .venv.
+# download dialog instead of mixing audio-separator/CUDA dependencies into .venv.
 uv>=0.8,<1.0
 
 # UI
