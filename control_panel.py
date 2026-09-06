@@ -460,10 +460,6 @@ class ControlPanel(QWidget):
             self._download_audio_preprocessor
         )
         preprocess_layout.addWidget(self._audio_preprocess_download, 1, 2)
-        hint = QLabel(t("audio_preprocess_hint"))
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: #888; font-size: 11px;")
-        preprocess_layout.addWidget(hint, 2, 0, 1, 3)
         layout.addWidget(preprocess_group)
         self._update_audio_preprocess_status()
 
