@@ -3,7 +3,7 @@
 audio:
   # WASAPI loopback device name (null = default output device)
   device: null
-  # Optional preprocessing before VAD: off, rnnoise, demucs_v4, clearvoice_mossformer2_se
+  # Optional preprocessing before VAD: off, demucs_v4, clearvoice_mossformer2_se
   preprocess_mode: "off"
   # Sample rate for capture
   sample_rate: 16000

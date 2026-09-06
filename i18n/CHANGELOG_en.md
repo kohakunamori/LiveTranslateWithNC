@@ -4,12 +4,15 @@
 - Fixed intermittent Silero VAD degradation across long-running sessions by resetting the model's recurrent state at segment and stream boundaries, including pause/resume, detector-mode changes, audio-device changes, and ASR-engine switches
 - VAD settings updates are now serialized with the capture thread, preventing detector state from being mutated concurrently while audio chunks are being evaluated
 - Added optional machine-local Demucs/ClearVoice runtime overrides so multiple LiveTranslate worktrees can reuse the same heavy uv environments instead of duplicating multi-gigabyte dependencies
+- Demucs/ClearVoice now keep isolated uv overlays while reusing compatible dependencies from the main environment; Demucs no longer downloads a duplicate multi-gigabyte PyTorch runtime
+- Model downloads now run in an isolated child process with a dedicated concise download log instead of attaching the download window to the application's root logger/stderr
+- Removed the RNNoise preprocessing mode and its managed FFmpeg/model runtime
 
 ## 2026-09-05
-- Added optional audio preprocessing before VAD with four modes: Off, RNNoise, Demucs v4, and ClearerVoice / MossFormer2 SE
+- Added optional audio preprocessing before VAD with Off, Demucs v4, and ClearerVoice / MossFormer2 SE modes
 - Preprocessed PCM now feeds VAD first, so ASR, translation, and all downstream stages consistently operate on the enhanced/separated audio
 - Added asynchronous persistent workers for heavy preprocessors so GPU inference does not block the audio-capture thread; Demucs and ClearVoice use isolated uv-managed runtimes
-- Integrated preprocessing assets into the existing model download/cache UI; RNNoise now installs a managed FFmpeg runtime with `arnndn` support via uv and requires no system FFmpeg
+- Integrated preprocessing assets into the existing model download/cache UI
 
 ## 2026-08-17
 - Incremental ASR sentence segmentation switched from PySBD to yasbd-lib (#37): API-compatible with no behavior change, adds native rules for Korean and 16 more languages (Korean previously fell back to English rules), and is much faster on long text

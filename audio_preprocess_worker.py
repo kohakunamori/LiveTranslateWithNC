@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import struct
-import subprocess
 import sys
 import tempfile
 import traceback
@@ -40,66 +38,6 @@ def _fit_length(samples: np.ndarray, length: int) -> np.ndarray:
     if len(samples) < length:
         return np.pad(samples, (0, length - len(samples))).astype(np.float32)
     return samples.copy()
-
-
-class RNNoiseBackend:
-    def __init__(self, model_dir: Path, sample_rate: int):
-        self.sample_rate = sample_rate
-        self.model = (model_dir / "std.rnnn").resolve()
-        if not self.model.is_file():
-            raise FileNotFoundError(self.model)
-        managed_ffmpeg = model_dir / "runtime" / "ffmpeg.exe"
-        if managed_ffmpeg.is_file():
-            self.ffmpeg = str(managed_ffmpeg.resolve())
-        else:
-            system_ffmpeg = shutil.which("ffmpeg")
-            if not system_ffmpeg:
-                raise FileNotFoundError("RNNoise FFmpeg runtime is missing")
-            self.ffmpeg = system_ffmpeg
-        try:
-            self.model_arg = self.model.relative_to(Path.cwd()).as_posix()
-        except ValueError:
-            # FFmpeg filter option parsing needs the Windows drive colon escaped.
-            self.model_arg = self.model.as_posix().replace(":", r"\:")
-
-    def process(self, samples: np.ndarray) -> np.ndarray:
-        cmd = [
-            self.ffmpeg,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "f32le",
-            "-ar",
-            str(self.sample_rate),
-            "-ac",
-            "1",
-            "-i",
-            "pipe:0",
-            "-af",
-            f"aresample=48000,arnndn=m={self.model_arg},aresample={self.sample_rate}",
-            "-f",
-            "f32le",
-            "-ar",
-            str(self.sample_rate),
-            "-ac",
-            "1",
-            "pipe:1",
-        ]
-        cp = subprocess.run(
-            cmd,
-            input=np.asarray(samples, dtype=np.float32).tobytes(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        if cp.returncode != 0:
-            raise RuntimeError(cp.stderr.decode("utf-8", errors="replace").strip())
-        output = np.frombuffer(cp.stdout, dtype=np.float32)
-        return _fit_length(output, len(samples))
-
-    def close(self):
-        pass
 
 
 class DemucsBackend:
@@ -189,8 +127,6 @@ class ClearVoiceBackend:
 
 
 def _make_backend(mode: str, model_dir: Path, sample_rate: int):
-    if mode == "rnnoise":
-        return RNNoiseBackend(model_dir, sample_rate)
     if mode == "demucs_v4":
         return DemucsBackend(model_dir, sample_rate)
     if mode == "clearvoice_mossformer2_se":

@@ -4,7 +4,6 @@ import logging
 import queue
 import struct
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
@@ -22,11 +21,10 @@ from model_manager import (
 log = logging.getLogger("LiveTranslate.AudioPreprocess")
 APP_DIR = Path(__file__).parent
 
-# Keep windows aligned to the application's native 32 ms VAD chunks. RNNoise is
-# light enough for a short window; source-separation/enhancement models need more
-# context and therefore intentionally add a few seconds of latency.
+# Keep windows aligned to the application's native 32 ms VAD chunks. Heavy
+# source-separation/enhancement models need enough context to amortize per-call
+# overhead, so they intentionally add a few seconds of latency.
 _WINDOW_CHUNKS = {
-    "rnnoise": 15,  # 0.48 s at the default 32 ms chunk size
     "demucs_v4": 250,  # 8.0 s; amortizes Demucs per-call overhead
     "clearvoice_mossformer2_se": 125,  # 4.0 s
 }
@@ -100,12 +98,9 @@ class AudioPreprocessor:
             if not is_audio_preprocessor_ready(self.mode):
                 raise RuntimeError(f"Audio preprocessor is not ready: {self.display_name}")
 
-            if self.mode == "rnnoise":
-                python = Path(sys.executable)
-            else:
-                python = audio_preprocessor_env_python(self.mode)
-                if python is None or not python.is_file():
-                    raise RuntimeError(f"Missing runtime for {self.display_name}")
+            python = audio_preprocessor_env_python(self.mode)
+            if python is None or not python.is_file():
+                raise RuntimeError(f"Missing runtime for {self.display_name}")
 
             worker = APP_DIR / "audio_preprocess_worker.py"
             model_dir = audio_preprocessor_model_dir(self.mode)

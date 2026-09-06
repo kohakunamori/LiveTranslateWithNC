@@ -2,10 +2,9 @@ import json
 import logging
 import re
 import sys
-import threading
 from pathlib import Path
 
-from PyQt6.QtCore import QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, QProcess, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication,
@@ -29,7 +28,6 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from model_manager import download_asr, download_audio_preprocessor, download_silero
 from i18n import t, get_lang
 
 log = logging.getLogger("LiveTranslate.Dialogs")
@@ -90,33 +88,94 @@ class _LogCapture(logging.Handler):
             pass
 
 
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+class _IsolatedDownloadProcess(QObject):
+    """Run model downloads in a child process and expose only curated stdout."""
 
+    log_line = pyqtSignal(str)
+    finished = pyqtSignal(bool, str)
 
-class _StderrCapture:
-    """Captures stderr (tqdm) and forwards cleaned lines via callback."""
+    def __init__(self, items, *, hub="ms", proxy="system", parent=None):
+        super().__init__(parent)
+        self._items = list(items)
+        self._hub = hub
+        self._proxy = proxy
+        self._stdout_buffer = ""
+        self._stderr_buffer = ""
+        self._last_error = ""
+        self._finished_emitted = False
 
-    def __init__(self, callback, original):
-        self._cb = callback
-        self._orig = original
+        self._process = QProcess(self)
+        self._process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
+        self._process.readyReadStandardOutput.connect(self._read_stdout)
+        self._process.readyReadStandardError.connect(self._read_stderr)
+        self._process.finished.connect(self._on_finished)
+        self._process.errorOccurred.connect(self._on_process_error)
 
-    def write(self, text):
-        if self._orig:
-            self._orig.write(text)
-        if not text:
-            return
-        cleaned = _ANSI_RE.sub("", text)
-        for line in cleaned.splitlines():
-            line = line.strip()
+    @property
+    def running(self) -> bool:
+        return self._process.state() != QProcess.ProcessState.NotRunning
+
+    def start(self):
+        worker = Path(__file__).parent / "model_download_worker.py"
+        spec = json.dumps(
+            {"items": self._items, "hub": self._hub, "proxy": self._proxy},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        self._process.setWorkingDirectory(str(Path(__file__).parent))
+        self._process.start(sys.executable, [str(worker), "--spec", spec])
+
+    def terminate(self):
+        if self.running:
+            self._process.terminate()
+
+    def _emit_stdout_lines(self, final=False):
+        while "\n" in self._stdout_buffer:
+            line, self._stdout_buffer = self._stdout_buffer.split("\n", 1)
+            line = line.rstrip("\r").strip()
             if line:
-                self._cb(line)
+                if line.startswith("Download failed:"):
+                    self._last_error = line.split(":", 1)[1].strip()
+                self.log_line.emit(line)
+        if final:
+            line = self._stdout_buffer.rstrip("\r").strip()
+            self._stdout_buffer = ""
+            if line:
+                if line.startswith("Download failed:"):
+                    self._last_error = line.split(":", 1)[1].strip()
+                self.log_line.emit(line)
 
-    def flush(self):
-        if self._orig:
-            self._orig.flush()
+    def _read_stdout(self):
+        data = bytes(self._process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        self._stdout_buffer += data
+        self._emit_stdout_lines()
 
-    def isatty(self):
-        return False
+    def _read_stderr(self):
+        data = bytes(self._process.readAllStandardError()).decode("utf-8", errors="replace")
+        if data:
+            self._stderr_buffer = (self._stderr_buffer + data)[-12000:]
+
+    def _on_process_error(self, error):
+        if self._process.state() == QProcess.ProcessState.NotRunning and not self._finished_emitted:
+            self._finish(False, f"Download worker could not start ({error})")
+
+    def _on_finished(self, exit_code, _exit_status):
+        self._read_stdout()
+        self._read_stderr()
+        self._emit_stdout_lines(final=True)
+        if exit_code == 0:
+            self._finish(True, "")
+            return
+        error = self._last_error
+        if not error and self._stderr_buffer.strip():
+            error = self._stderr_buffer.strip().splitlines()[-1]
+        self._finish(False, error or f"Download worker exited with code {exit_code}")
+
+    def _finish(self, ok: bool, error: str):
+        if self._finished_emitted:
+            return
+        self._finished_emitted = True
+        self.finished.emit(ok, error)
 
 
 class _ModelLoadDialog(QDialog):
@@ -168,8 +227,6 @@ class _ModelLoadDialog(QDialog):
 
 class SetupWizardDialog(QDialog):
     """First-launch wizard: choose hub, download models."""
-
-    _log_signal = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -235,8 +292,7 @@ class SetupWizardDialog(QDialog):
         layout.addWidget(self._log_view)
 
         self._error = None
-        self._log_signal.connect(self._append_log)
-        self._log_handler = _LogCapture(self._log_signal.emit)
+        self._download_job = None
 
         # Auto-start countdown
         self._countdown = 15
@@ -295,38 +351,23 @@ class SetupWizardDialog(QDialog):
 
         hub = "ms" if self._hub_combo.currentIndex() == 0 else "hf"
         self._proxy = self._download_proxy()
-
-        logging.getLogger().addHandler(self._log_handler)
-        self._orig_stderr = sys.stderr
-        sys.stderr = _StderrCapture(self._log_signal.emit, self._orig_stderr)
-
         self._error = None
-        self._download_thread = threading.Thread(
-            target=self._download_worker, args=(hub, self._proxy), daemon=True
+        self._download_job = _IsolatedDownloadProcess(
+            [
+                {"name": "Silero VAD", "type": "silero-vad"},
+                {"name": "SenseVoice Small", "type": "funasr:sensevoice-small"},
+            ],
+            hub=hub,
+            proxy=self._proxy,
+            parent=self,
         )
-        self._download_thread.start()
+        self._download_job.log_line.connect(self._append_log)
+        self._download_job.finished.connect(self._download_finished)
+        self._download_job.start()
 
-        self._poll_timer = QTimer()
-        self._poll_timer.setInterval(200)
-        self._poll_timer.timeout.connect(self._check_done)
-        self._poll_timer.start()
-
-    def _download_worker(self, hub, proxy):
-        try:
-            download_silero(proxy=proxy)
-            download_asr("funasr", model_size="sensevoice-small", hub=hub, proxy=proxy)
-        except Exception as e:
-            self._error = str(e)
-            log.error(f"Download failed: {e}", exc_info=True)
-
-    def _check_done(self):
-        if self._download_thread.is_alive():
-            return
-        self._poll_timer.stop()
-        sys.stderr = self._orig_stderr
-        logging.getLogger().removeHandler(self._log_handler)
-
-        if self._error:
+    def _download_finished(self, ok, error):
+        self._error = error or None
+        if not ok:
             self._append_log(f"\n{t('download_failed').format(error=self._error)}")
             self._download_btn.setEnabled(True)
             self._download_btn.setText(t("btn_retry"))
@@ -360,8 +401,6 @@ class SetupWizardDialog(QDialog):
 
 class ModelDownloadDialog(QDialog):
     """Download missing models (non-first-launch) with live log."""
-
-    _log_signal = pyqtSignal(str)
 
     def __init__(self, missing_models, hub="ms", proxy="system", parent=None):
         super().__init__(parent)
@@ -399,9 +438,7 @@ class ModelDownloadDialog(QDialog):
         self._hub = hub
         self._proxy = proxy
         self._error = None
-
-        self._log_signal.connect(self._append_log)
-        self._log_handler = _LogCapture(self._log_signal.emit)
+        self._download_job = None
 
         QTimer.singleShot(100, self._start_download)
 
@@ -412,60 +449,20 @@ class ModelDownloadDialog(QDialog):
         )
 
     def _start_download(self):
-        logging.getLogger().addHandler(self._log_handler)
-        self._orig_stderr = sys.stderr
-        sys.stderr = _StderrCapture(self._log_signal.emit, self._orig_stderr)
-
-        self._download_thread = threading.Thread(
-            target=self._download_worker, daemon=True
+        self._error = None
+        self._download_job = _IsolatedDownloadProcess(
+            self._missing,
+            hub=self._hub,
+            proxy=self._proxy,
+            parent=self,
         )
-        self._download_thread.start()
+        self._download_job.log_line.connect(self._append_log)
+        self._download_job.finished.connect(self._download_finished)
+        self._download_job.start()
 
-        self._poll_timer = QTimer()
-        self._poll_timer.setInterval(200)
-        self._poll_timer.timeout.connect(self._check_done)
-        self._poll_timer.start()
-
-    def _download_worker(self):
-        try:
-            for m in self._missing:
-                if m["type"] == "silero-vad":
-                    download_silero(proxy=self._proxy)
-                elif m["type"] in (
-                    "sensevoice",
-                    "funasr-nano",
-                    "funasr-mlt-nano",
-                    "anime-whisper",
-                ):
-                    download_asr(m["type"], hub=self._hub, proxy=self._proxy)
-                elif m["type"].startswith("funasr:"):
-                    model_key = m["type"].split(":", 1)[1]
-                    download_asr(
-                        "funasr",
-                        model_size=model_key,
-                        hub=self._hub,
-                        proxy=self._proxy,
-                    )
-                elif m["type"].startswith("whisper-"):
-                    size = m["type"].replace("whisper-", "")
-                    download_asr(
-                        "whisper", model_size=size, hub=self._hub, proxy=self._proxy
-                    )
-                elif m["type"].startswith("preprocess:"):
-                    mode = m["type"].split(":", 1)[1]
-                    download_audio_preprocessor(mode, proxy=self._proxy)
-        except Exception as e:
-            self._error = str(e)
-            log.error(f"Download failed: {e}", exc_info=True)
-
-    def _check_done(self):
-        if self._download_thread.is_alive():
-            return
-        self._poll_timer.stop()
-        sys.stderr = self._orig_stderr
-        logging.getLogger().removeHandler(self._log_handler)
-
-        if self._error:
+    def _download_finished(self, ok, error):
+        self._error = error or None
+        if not ok:
             self._append_log(f"\n{t('download_failed').format(error=self._error)}")
             self._close_btn.show()
             return

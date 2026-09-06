@@ -434,7 +434,6 @@ class ControlPanel(QWidget):
         preprocess_layout.setColumnStretch(1, 1)
         self._audio_preprocess_mode = QComboBox()
         self._audio_preprocess_mode.addItem(t("preprocess_off"), "off")
-        self._audio_preprocess_mode.addItem("RNNoise", "rnnoise")
         self._audio_preprocess_mode.addItem("Demucs v4", "demucs_v4")
         self._audio_preprocess_mode.addItem(
             "ClearerVoice / MossFormer2 SE", "clearvoice_mossformer2_se"

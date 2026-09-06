@@ -4,12 +4,15 @@
 - 修复 Silero VAD 长时间运行后偶发识别退化的问题：在分段/流边界重置模型 recurrent state，并覆盖暂停/恢复、VAD 模式切换、音频设备切换与 ASR 引擎切换等场景
 - VAD 设置更新现在与音频采集线程串行化，避免处理音频 chunk 时并发修改检测器状态
 - 新增 Demucs/ClearVoice 本机共享 runtime override，可让多个 LiveTranslate 工作区复用同一套重型 uv 环境，避免重复占用数 GB 空间
+- Demucs/ClearVoice 现在保留独立 uv overlay，同时复用主环境中兼容的依赖；Demucs 不再重复下载数 GB 的 PyTorch 运行时
+- 模型下载改为独立子进程执行，下载窗口只显示专用精简日志，不再挂接主程序 root logger / 全局 stderr
+- 移除 RNNoise 音频预处理模式及其受管 FFmpeg / 模型运行时
 
 ## 2026-09-05
-- 新增 VAD 前音频预处理，支持「关闭 / RNNoise / Demucs v4 / ClearerVoice / MossFormer2 SE」四种模式
+- 新增 VAD 前音频预处理，支持「关闭 / Demucs v4 / ClearerVoice / MossFormer2 SE」模式
 - 开启后处理后的 PCM 会先进入 VAD，因此 ASR、翻译和所有后续流程都统一基于增强/分离后的音频工作
 - 重模型改为常驻异步 worker，GPU 推理不阻塞音频采集线程；Demucs 与 ClearVoice 使用 uv 管理的独立运行环境
-- 预处理模型与运行时接入现有模型下载/缓存 UI；RNNoise 通过 uv 安装带 `arnndn` 的受管 FFmpeg，无需用户预装系统 FFmpeg
+- 预处理模型与运行时接入现有模型下载/缓存 UI
 
 ## 2026-08-17
 - 增量 ASR 的分句库从 PySBD 切换到 yasbd-lib (#37): API 兼容无行为变化, 新增韩语等 17 种语言的原生分句规则 (此前韩语回退英语规则), 长文本分割速度大幅提升

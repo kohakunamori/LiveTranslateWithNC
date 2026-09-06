@@ -1,11 +1,17 @@
-import os
 import contextlib
+import functools
+import json
 import logging
+import os
+import queue
+import re
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 
-log = logging.getLogger("LiveTranslate.ModelManager")
+log = logging.getLogger("LiveTranslate.Download")
 
 _PROXY_ENV_KEYS = (
     "HTTP_PROXY",
@@ -82,23 +88,18 @@ PREPROCESSOR_PROFILES = {
         "display_name": "Off",
         "estimated_bytes": 0,
     },
-    "rnnoise": {
-        "display_name": "RNNoise",
-        "estimated_bytes": 303_000,
-        "runtime_estimated_bytes": 31_000_000,
-        "model_url": "https://raw.githubusercontent.com/richardpl/arnndn-models/master/std.rnnn",
-        "ffmpeg_package": "imageio-ffmpeg==0.6.0",
-    },
     "demucs_v4": {
         "display_name": "Demucs v4",
         "estimated_bytes": 85_000_000,
         "runtime_estimated_bytes": 2_800_000_000,
+        "shared_runtime_estimated_bytes": 50_000_000,
         "env": "demucs",
     },
     "clearvoice_mossformer2_se": {
         "display_name": "ClearerVoice / MossFormer2 SE",
         "estimated_bytes": 222_000_000,
         "runtime_estimated_bytes": 2_900_000_000,
+        "shared_runtime_estimated_bytes": 500_000_000,
         "env": "clearvoice",
     },
 }
@@ -520,6 +521,65 @@ def _external_audio_preprocessor_python(mode: str | None) -> Path | None:
     return path
 
 
+def _major_minor(version: str) -> tuple[int, int] | None:
+    try:
+        parts = version.split("+", 1)[0].split(".")
+        return int(parts[0]), int(parts[1])
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
+@functools.lru_cache(maxsize=1)
+def _shared_torch_runtime() -> dict | None:
+    """Return the app's main Torch runtime when an overlay can safely reuse it."""
+    python = APP_DIR / ".venv" / "Scripts" / "python.exe"
+    if not python.is_file():
+        return None
+
+    # Metadata probing is intentionally cheap: importing CUDA Torch while the
+    # live app is using the GPU can take tens of seconds and false-negative the
+    # shared-runtime check. The overlay performs a real import validation after
+    # installing its small package set.
+    probe = (
+        "import importlib.metadata as m, json, sysconfig; "
+        "print(json.dumps({"
+        "'torch': m.version('torch'), "
+        "'torchaudio': m.version('torchaudio'), "
+        "'site_packages': sysconfig.get_paths()['purelib']"
+        "}))"
+    )
+    try:
+        result = subprocess.run(
+            [str(python), "-c", probe],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        info = json.loads(result.stdout.strip().splitlines()[-1])
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return None
+
+    torch_mm = _major_minor(str(info.get("torch", "")))
+    torchaudio_mm = _major_minor(str(info.get("torchaudio", "")))
+    if torch_mm is None or torch_mm < (2, 1) or torchaudio_mm != torch_mm:
+        return None
+    site_packages = Path(str(info.get("site_packages", "")))
+    if not site_packages.is_dir():
+        return None
+
+    version = str(info.get("torch", ""))
+    info["cuda"] = version.split("+", 1)[1] if "+" in version else "cpu"
+    info["python"] = python
+    info["site_packages"] = site_packages
+    return info
+
+
 def audio_preprocessor_env_python(mode: str | None) -> Path | None:
     mode = normalize_audio_preprocess_mode(mode)
     external = _external_audio_preprocessor_python(mode)
@@ -531,39 +591,12 @@ def audio_preprocessor_env_python(mode: str | None) -> Path | None:
     return PREPROCESS_ENVS_DIR / env_name / "Scripts" / "python.exe"
 
 
-def audio_preprocessor_ffmpeg_executable() -> Path | None:
-    managed = audio_preprocessor_model_dir("rnnoise") / "runtime" / "ffmpeg.exe"
-    if managed.is_file():
-        return managed
-    system = shutil.which("ffmpeg")
-    return Path(system) if system else None
-
-
-def _ffmpeg_supports_arnndn(executable: Path | str | None) -> bool:
-    if not executable:
-        return False
-    try:
-        result = subprocess.run(
-            [str(executable), "-hide_banner", "-filters"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return result.returncode == 0 and "arnndn" in result.stdout
-
 
 def _audio_preprocessor_model_present(mode: str | None) -> bool:
     mode = normalize_audio_preprocess_mode(mode)
     if mode == "off":
         return True
     model_dir = audio_preprocessor_model_dir(mode)
-    if mode == "rnnoise":
-        model = model_dir / "std.rnnn"
-        return model.is_file() and model.stat().st_size > 100_000
     if mode == "demucs_v4":
         return (
             (model_dir / "htdemucs.yaml").is_file()
@@ -592,9 +625,6 @@ def is_audio_preprocessor_ready(mode: str | None) -> bool:
     if not _audio_preprocessor_model_present(mode):
         return False
 
-    if mode == "rnnoise":
-        return _ffmpeg_supports_arnndn(audio_preprocessor_ffmpeg_executable())
-
     env_python = audio_preprocessor_env_python(mode)
     if env_python is None or not env_python.is_file():
         return False
@@ -609,13 +639,21 @@ def get_missing_audio_preprocessor(mode: str | None) -> list[dict]:
     estimated = 0
     if not _audio_preprocessor_model_present(mode):
         estimated += int(profile.get("estimated_bytes", 0))
-    if mode == "rnnoise" and not _ffmpeg_supports_arnndn(
-        audio_preprocessor_ffmpeg_executable()
-    ):
-        estimated += int(profile.get("runtime_estimated_bytes", 0))
-    env_python = audio_preprocessor_env_python(mode)
-    if profile.get("env") and (env_python is None or not env_python.exists()):
-        estimated += int(profile.get("runtime_estimated_bytes", 0))
+    external_python = _external_audio_preprocessor_python(mode)
+    env_name = profile.get("env")
+    runtime_missing = False
+    if env_name:
+        if external_python is not None:
+            runtime_missing = not external_python.exists()
+        else:
+            runtime_missing = not (PREPROCESS_ENVS_DIR / env_name / ".deps-ready").exists()
+    if runtime_missing:
+        runtime_estimated = int(profile.get("runtime_estimated_bytes", 0))
+        if mode in ("demucs_v4", "clearvoice_mossformer2_se") and _shared_torch_runtime() is not None:
+            runtime_estimated = int(
+                profile.get("shared_runtime_estimated_bytes", runtime_estimated)
+            )
+        estimated += runtime_estimated
     return [
         {
             "name": profile["display_name"],
@@ -638,12 +676,18 @@ def _uv_executable() -> str:
     raise RuntimeError("uv is required for optional audio preprocessing runtimes")
 
 
-def _run_logged(cmd: list[str], *, cwd: Path | None = None) -> None:
+def _run_logged(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    progress_label: str | None = None,
+) -> None:
     log.info("Running: " + " ".join(map(str, cmd)))
     env = os.environ.copy()
     env.setdefault("UV_CACHE_DIR", str(APP_DIR / ".uv-cache"))
     env.setdefault("UV_PYTHON_INSTALL_DIR", str(APP_DIR / "tools" / "python"))
     env.setdefault("UV_LINK_MODE", "copy")
+    env.setdefault("UV_NO_PROGRESS", "1")
     env.setdefault("TMP", str(APP_DIR / ".tmp"))
     env.setdefault("TEMP", str(APP_DIR / ".tmp"))
     Path(env["UV_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
@@ -659,10 +703,40 @@ def _run_logged(cmd: list[str], *, cwd: Path | None = None) -> None:
         errors="replace",
     )
     assert proc.stdout is not None
-    for line in proc.stdout:
-        line = line.rstrip()
-        if line:
-            log.info(line)
+
+    lines: queue.Queue[str | None] = queue.Queue()
+
+    def _read_output() -> None:
+        try:
+            for line in proc.stdout:
+                lines.put(line)
+        finally:
+            lines.put(None)
+
+    threading.Thread(target=_read_output, daemon=True).start()
+    started = time.monotonic()
+    last_heartbeat = started
+    output_done = False
+    while not output_done:
+        try:
+            line = lines.get(timeout=1.0)
+        except queue.Empty:
+            line = ""
+        if line is None:
+            output_done = True
+        elif line:
+            text = line.rstrip()
+            if text:
+                log.info(text)
+        now = time.monotonic()
+        if (
+            progress_label
+            and proc.poll() is None
+            and now - last_heartbeat >= 15.0
+        ):
+            elapsed = int(now - started)
+            log.info(f"{progress_label}: still working ({elapsed}s elapsed)")
+            last_heartbeat = now
     code = proc.wait()
     if code != 0:
         raise RuntimeError(f"Command failed with exit code {code}: {cmd[0]}")
@@ -719,55 +793,6 @@ def _download_url(url: str, target: Path, label: str) -> None:
             pass
 
 
-def _ensure_rnnoise_ffmpeg(profile: dict, model_dir: Path) -> Path:
-    existing = audio_preprocessor_ffmpeg_executable()
-    if existing and _ffmpeg_supports_arnndn(existing):
-        log.info(f"RNNoise FFmpeg runtime ready: {existing}")
-        return Path(existing)
-
-    import uuid
-
-    token = uuid.uuid4().hex
-    stage_dir = APP_DIR / ".tmp" / f"rnnoise-ffmpeg-{token}"
-    shutil.rmtree(stage_dir, ignore_errors=True)
-    stage_dir.parent.mkdir(parents=True, exist_ok=True)
-    target = model_dir / "runtime" / "ffmpeg.exe"
-    target_part = target.with_name(f"ffmpeg.{token}.exe.part")
-    target.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        uv = _uv_executable()
-        log.info("Installing managed RNNoise FFmpeg runtime with uv...")
-        _run_logged(
-            [
-                uv,
-                "pip",
-                "install",
-                "--native-tls",
-                "--link-mode",
-                "copy",
-                "--target",
-                str(stage_dir),
-                profile["ffmpeg_package"],
-            ]
-        )
-        binaries = sorted(
-            (stage_dir / "imageio_ffmpeg" / "binaries").glob("ffmpeg-*.exe")
-        )
-        if not binaries:
-            raise RuntimeError("imageio-ffmpeg installed without a Windows FFmpeg binary")
-        shutil.copy2(binaries[0], target_part)
-        target_part.replace(target)
-    finally:
-        target_part.unlink(missing_ok=True)
-        shutil.rmtree(stage_dir, ignore_errors=True)
-
-    if not _ffmpeg_supports_arnndn(target):
-        target.unlink(missing_ok=True)
-        raise RuntimeError("Downloaded FFmpeg runtime does not include the arnndn filter")
-    log.info(f"RNNoise managed FFmpeg ready: {target}")
-    return target
-
 
 def _torch_index_for_host() -> str:
     try:
@@ -785,6 +810,136 @@ def _torch_index_for_host() -> str:
     except Exception:
         pass
     return "cpu"
+
+
+def _resolve_shared_overlay_packages(
+    uv: str,
+    main_python: Path,
+    requirements: list[str],
+    *,
+    label: str,
+) -> list[str]:
+    """Resolve only packages that the main environment does not already satisfy."""
+    cmd = [
+        uv,
+        "pip",
+        "install",
+        "--system-certs",
+        "--dry-run",
+        "--color",
+        "never",
+        "--python",
+        str(main_python),
+        *requirements,
+    ]
+    log.info(f"Comparing {label} dependencies with the main LiveTranslate environment...")
+    env = os.environ.copy()
+    env.setdefault("UV_CACHE_DIR", str(APP_DIR / ".uv-cache"))
+    env.setdefault("UV_PYTHON_INSTALL_DIR", str(APP_DIR / "tools" / "python"))
+    env.setdefault("UV_NO_PROGRESS", "1")
+    result = subprocess.run(
+        [str(x) for x in cmd],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=180,
+        check=False,
+    )
+    for line in result.stdout.splitlines():
+        text = line.strip()
+        if text:
+            log.info(text)
+    if result.returncode != 0:
+        raise RuntimeError(f"Could not resolve shared dependencies for {label}")
+
+    package_re = re.compile(r"^\+\s+([A-Za-z0-9_.-]+)==([^\s]+)$")
+    planned: list[str] = []
+    for line in result.stdout.splitlines():
+        match = package_re.match(line.strip())
+        if match:
+            planned.append(f"{match.group(1)}=={match.group(2)}")
+    log.info(
+        f"{label}: main environment can be reused; "
+        f"isolated overlay needs {len(planned)} package(s)"
+    )
+    return planned
+
+
+def _install_shared_preprocessor_overlay(
+    mode: str,
+    uv: str,
+    env_dir: Path,
+    python: Path,
+    shared_torch: dict,
+) -> None:
+    """Keep an isolated venv while reusing compatible packages from the main venv."""
+    profile = PREPROCESSOR_PROFILES[mode]
+    site_packages = env_dir / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True, exist_ok=True)
+    main_site_packages = Path(shared_torch["site_packages"])
+    relative_main_site = os.path.relpath(main_site_packages, site_packages)
+    (site_packages / "livetranslate-main-runtime.pth").write_text(
+        relative_main_site + "\n", encoding="utf-8"
+    )
+
+    cuda = shared_torch.get("cuda") or "CPU"
+    log.info(
+        f"Using isolated {profile['display_name']} overlay with shared main runtime: "
+        f"torch={shared_torch['torch']}, "
+        f"torchaudio={shared_torch['torchaudio']}, CUDA={cuda}"
+    )
+
+    if mode == "demucs_v4":
+        requirements = ["demucs==4.1.0"]
+        validate = (
+            "import torch, torchaudio; "
+            "from demucs.api import Separator; "
+            "import einops, julius, lameenc, sphn; "
+            "print('Demucs runtime ready: torch=' + torch.__version__ + "
+            "', torchaudio=' + torchaudio.__version__)"
+        )
+    elif mode == "clearvoice_mossformer2_se":
+        requirements = ["clearvoice==0.1.2"]
+        validate = (
+            "import torch, torchaudio, numpy, librosa, soundfile; "
+            "from clearvoice import ClearVoice; "
+            "print('ClearVoice runtime ready: torch=' + torch.__version__ + "
+            "', numpy=' + numpy.__version__ + ', librosa=' + librosa.__version__)"
+        )
+    else:
+        raise ValueError(f"Unsupported shared overlay mode: {mode}")
+
+    planned = _resolve_shared_overlay_packages(
+        uv,
+        Path(shared_torch["python"]),
+        requirements,
+        label=profile["display_name"],
+    )
+    if planned:
+        log.info(
+            f"Installing {profile['display_name']} isolated overlay packages: "
+            + ", ".join(planned)
+        )
+        _run_logged(
+            [
+                uv,
+                "pip",
+                "install",
+                "--system-certs",
+                "--no-deps",
+                "--python",
+                str(python),
+                *planned,
+            ],
+            progress_label=f"Installing {profile['display_name']} overlay",
+        )
+    _run_logged(
+        [str(python), "-c", validate],
+        progress_label=f"Validating shared {profile['display_name']} runtime",
+    )
 
 
 def _ensure_audio_preprocessor_env(mode: str) -> Path:
@@ -812,9 +967,19 @@ def _ensure_audio_preprocessor_env(mode: str) -> Path:
     PREPROCESS_ENVS_DIR.mkdir(parents=True, exist_ok=True)
     if not python.exists():
         log.info(f"Creating uv environment for {profile['display_name']}...")
-        _run_logged([uv, "venv", "--python", "3.12", str(env_dir)])
+        _run_logged(
+            [uv, "venv", "--python", "3.12", str(env_dir)],
+            progress_label=f"Creating {profile['display_name']} runtime",
+        )
     if deps_marker.exists():
         return python
+
+    if mode in ("demucs_v4", "clearvoice_mossformer2_se"):
+        shared_torch = _shared_torch_runtime()
+        if shared_torch is not None:
+            _install_shared_preprocessor_overlay(mode, uv, env_dir, python, shared_torch)
+            deps_marker.write_text("shared-main-runtime\n", encoding="ascii")
+            return python
 
     torch_index = _torch_index_for_host()
     index_url = (
@@ -828,21 +993,22 @@ def _ensure_audio_preprocessor_env(mode: str) -> Path:
             uv,
             "pip",
             "install",
-            "--native-tls",
+            "--system-certs",
             "--python",
             str(python),
             "torch==2.8.0",
             "torchaudio==2.8.0",
             "--index-url",
             index_url,
-        ]
+        ],
+        progress_label=f"Installing PyTorch runtime ({torch_index})",
     )
     if mode == "demucs_v4":
         packages = ["demucs==4.1.0"]
     elif mode == "clearvoice_mossformer2_se":
         packages = [
             "clearvoice==0.1.2",
-            "numpy==2.1.2",
+            "numpy==1.26.4",
             "librosa==0.10.2.post1",
             "soundfile==0.12.1",
         ]
@@ -851,7 +1017,8 @@ def _ensure_audio_preprocessor_env(mode: str) -> Path:
     if packages:
         log.info(f"Installing {profile['display_name']} dependencies with uv...")
         _run_logged(
-            [uv, "pip", "install", "--native-tls", "--python", str(python), *packages]
+            [uv, "pip", "install", "--system-certs", "--python", str(python), *packages],
+            progress_label=f"Installing {profile['display_name']} dependencies",
         )
     deps_marker.write_text("ready\n", encoding="ascii")
     return python
@@ -868,17 +1035,7 @@ def download_audio_preprocessor(mode: str | None, proxy: str = "system") -> None
     marker.unlink(missing_ok=True)
 
     with _proxy_env(proxy):
-        if mode == "rnnoise":
-            _ensure_rnnoise_ffmpeg(profile, model_dir)
-            target = model_dir / "std.rnnn"
-            if not _audio_preprocessor_model_present(mode):
-                _download_url(profile["model_url"], target, "RNNoise model")
-            else:
-                log.info("RNNoise model already cached; reusing it")
-            if target.stat().st_size <= 100_000:
-                raise RuntimeError("RNNoise model download is incomplete")
-
-        elif mode == "demucs_v4":
+        if mode == "demucs_v4":
             _ensure_audio_preprocessor_env(mode)
             target = model_dir / "955717e8-8726e21a.th"
             if not _audio_preprocessor_model_present(mode):

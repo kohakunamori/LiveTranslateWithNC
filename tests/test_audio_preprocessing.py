@@ -6,7 +6,6 @@ import pytest
 import yaml
 
 import model_manager
-from audio_preprocess_worker import RNNoiseBackend
 from audio_preprocessor import AudioPreprocessor
 
 
@@ -21,7 +20,6 @@ def test_audio_preprocessing_defaults_to_off():
 def test_supported_audio_preprocessing_modes_are_registered():
     assert set(model_manager.PREPROCESSOR_PROFILES) == {
         "off",
-        "rnnoise",
         "demucs_v4",
         "clearvoice_mossformer2_se",
     }
@@ -39,7 +37,7 @@ def test_off_mode_preserves_capture_pcm_contract():
 
 
 @pytest.mark.parametrize(
-    "mode", ["rnnoise", "demucs_v4", "clearvoice_mossformer2_se"]
+    "mode", ["demucs_v4", "clearvoice_mossformer2_se"]
 )
 def test_buffered_preprocessor_returns_original_32ms_chunk_shape(monkeypatch, mode):
     """Exercise buffering/async scheduling without loading an external model."""
@@ -125,66 +123,6 @@ def test_clearvoice_ready_requires_real_checkpoint_and_runtime(monkeypatch, tmp_
     assert model_manager.is_audio_preprocessor_ready("clearvoice_mossformer2_se")
 
 
-def test_rnnoise_ready_requires_model_and_arnndn_runtime(monkeypatch, tmp_path):
-    model_root = tmp_path / "models"
-    monkeypatch.setattr(model_manager, "PREPROCESS_MODELS_DIR", model_root)
-    model_dir = model_root / "rnnoise"
-    model_dir.mkdir(parents=True)
-    (model_dir / ".ready").write_text("ready\n", encoding="ascii")
-    model = model_dir / "std.rnnn"
-    model.write_bytes(b"x" * 100_001)
-
-    monkeypatch.setattr(model_manager, "audio_preprocessor_ffmpeg_executable", lambda: None)
-    assert not model_manager.is_audio_preprocessor_ready("rnnoise")
-
-    fake_ffmpeg = model_dir / "runtime" / "ffmpeg.exe"
-    fake_ffmpeg.parent.mkdir(parents=True)
-    fake_ffmpeg.write_bytes(b"fake")
-    monkeypatch.setattr(
-        model_manager, "audio_preprocessor_ffmpeg_executable", lambda: fake_ffmpeg
-    )
-    monkeypatch.setattr(model_manager, "_ffmpeg_supports_arnndn", lambda exe: True)
-    assert model_manager.is_audio_preprocessor_ready("rnnoise")
-
-
-def test_rnnoise_worker_prefers_managed_ffmpeg(tmp_path, monkeypatch):
-    model = tmp_path / "std.rnnn"
-    model.write_bytes(b"x")
-    managed = tmp_path / "runtime" / "ffmpeg.exe"
-    managed.parent.mkdir(parents=True)
-    managed.write_bytes(b"fake")
-    monkeypatch.setattr("audio_preprocess_worker.shutil.which", lambda name: "PATH-ffmpeg.exe")
-
-    backend = RNNoiseBackend(tmp_path, 16000)
-
-    assert backend.ffmpeg == str(managed.resolve())
-
-
-def test_rnnoise_managed_runtime_installer_extracts_imageio_binary(
-    tmp_path, monkeypatch
-):
-    model_dir = tmp_path / "rnnoise"
-    monkeypatch.setattr(model_manager, "APP_DIR", tmp_path)
-    monkeypatch.setattr(model_manager, "audio_preprocessor_ffmpeg_executable", lambda: None)
-    monkeypatch.setattr(model_manager, "_uv_executable", lambda: "uv")
-    monkeypatch.setattr(model_manager, "_ffmpeg_supports_arnndn", lambda exe: True)
-
-    def fake_run_logged(cmd, **kwargs):
-        target = Path(cmd[cmd.index("--target") + 1])
-        binary = target / "imageio_ffmpeg" / "binaries" / "ffmpeg-win-x86_64-v7.1.exe"
-        binary.parent.mkdir(parents=True)
-        binary.write_bytes(b"managed-ffmpeg")
-
-    monkeypatch.setattr(model_manager, "_run_logged", fake_run_logged)
-
-    installed = model_manager._ensure_rnnoise_ffmpeg(
-        model_manager.PREPROCESSOR_PROFILES["rnnoise"], model_dir
-    )
-
-    assert installed == model_dir / "runtime" / "ffmpeg.exe"
-    assert installed.read_bytes() == b"managed-ffmpeg"
-    assert not any((tmp_path / ".tmp").glob("rnnoise-ffmpeg-*"))
-
 
 def test_external_preprocessor_runtime_can_be_reused(monkeypatch, tmp_path):
     shared_env = tmp_path / "shared-demucs"
@@ -198,13 +136,138 @@ def test_external_preprocessor_runtime_can_be_reused(monkeypatch, tmp_path):
     assert model_manager._ensure_audio_preprocessor_env("demucs_v4") == python
 
 
+def test_demucs_runtime_reuses_main_torch_without_installing_torch(monkeypatch, tmp_path):
+    env_root = tmp_path / "envs"
+    env_dir = env_root / "demucs"
+    python = env_dir / "Scripts" / "python.exe"
+    main_site = tmp_path / "main" / "Lib" / "site-packages"
+    main_site.mkdir(parents=True)
+    commands = []
+
+    monkeypatch.delenv("LIVETRANSLATE_DEMUCS_PYTHON", raising=False)
+    monkeypatch.setattr(model_manager, "PREPROCESS_ENVS_DIR", env_root)
+    monkeypatch.setattr(model_manager, "_uv_executable", lambda: "uv")
+    monkeypatch.setattr(
+        model_manager,
+        "_shared_torch_runtime",
+        lambda: {
+            "python": tmp_path / "main" / "Scripts" / "python.exe",
+            "site_packages": main_site,
+            "torch": "2.11.0+cu128",
+            "torchaudio": "2.11.0+cu128",
+            "cuda": "12.8",
+        },
+    )
+    monkeypatch.setattr(
+        model_manager,
+        "_resolve_shared_overlay_packages",
+        lambda *args, **kwargs: [
+            "demucs==4.1.0",
+            "einops==0.8.2",
+            "julius==0.2.8",
+            "lameenc==1.8.4",
+            "sphn==0.2.1",
+        ],
+    )
+
+    def fake_run_logged(cmd, **kwargs):
+        commands.append((list(cmd), kwargs))
+        if len(cmd) > 1 and cmd[1] == "venv":
+            python.parent.mkdir(parents=True, exist_ok=True)
+            python.write_bytes(b"stub")
+
+    monkeypatch.setattr(model_manager, "_run_logged", fake_run_logged)
+
+    assert model_manager._ensure_audio_preprocessor_env("demucs_v4") == python
+    assert (env_dir / ".deps-ready").read_text(encoding="ascii") == "shared-main-runtime\n"
+
+    pth = env_dir / "Lib" / "site-packages" / "livetranslate-main-runtime.pth"
+    assert pth.is_file()
+    assert "main" in pth.read_text(encoding="utf-8")
+
+    install_commands = [cmd for cmd, _ in commands if "install" in cmd]
+    assert len(install_commands) == 1
+    install_cmd = install_commands[0]
+    assert "--no-deps" in install_cmd
+    assert "demucs==4.1.0" in install_cmd
+    assert "torch==2.8.0" not in install_cmd
+    assert "torchaudio==2.8.0" not in install_cmd
+
+
+def test_demucs_missing_size_uses_shared_runtime_estimate(monkeypatch, tmp_path):
+    monkeypatch.delenv("LIVETRANSLATE_DEMUCS_PYTHON", raising=False)
+    monkeypatch.setattr(model_manager, "PREPROCESS_MODELS_DIR", tmp_path / "models")
+    monkeypatch.setattr(model_manager, "PREPROCESS_ENVS_DIR", tmp_path / "envs")
+    monkeypatch.setattr(
+        model_manager,
+        "_shared_torch_runtime",
+        lambda: {"torch": "2.11.0+cu128"},
+    )
+
+    missing = model_manager.get_missing_audio_preprocessor("demucs_v4")
+    assert len(missing) == 1
+    assert missing[0]["estimated_bytes"] == 85_000_000 + 50_000_000
+
+
+def test_clearvoice_shared_runtime_keeps_conflicting_packages_in_overlay(monkeypatch, tmp_path):
+    env_root = tmp_path / "envs"
+    env_dir = env_root / "clearvoice"
+    python = env_dir / "Scripts" / "python.exe"
+    main_site = tmp_path / "main" / "Lib" / "site-packages"
+    main_site.mkdir(parents=True)
+    commands = []
+
+    monkeypatch.delenv("LIVETRANSLATE_CLEARVOICE_PYTHON", raising=False)
+    monkeypatch.setattr(model_manager, "PREPROCESS_ENVS_DIR", env_root)
+    monkeypatch.setattr(model_manager, "_uv_executable", lambda: "uv")
+    monkeypatch.setattr(
+        model_manager,
+        "_shared_torch_runtime",
+        lambda: {
+            "python": tmp_path / "main" / "Scripts" / "python.exe",
+            "site_packages": main_site,
+            "torch": "2.11.0+cu128",
+            "torchaudio": "2.11.0+cu128",
+            "cuda": "12.8",
+        },
+    )
+    monkeypatch.setattr(
+        model_manager,
+        "_resolve_shared_overlay_packages",
+        lambda *args, **kwargs: [
+            "clearvoice==0.1.2",
+            "numpy==1.26.4",
+            "librosa==0.10.2.post1",
+            "soundfile==0.12.1",
+        ],
+    )
+
+    def fake_run_logged(cmd, **kwargs):
+        commands.append((list(cmd), kwargs))
+        if len(cmd) > 1 and cmd[1] == "venv":
+            python.parent.mkdir(parents=True, exist_ok=True)
+            python.write_bytes(b"stub")
+
+    monkeypatch.setattr(model_manager, "_run_logged", fake_run_logged)
+
+    assert model_manager._ensure_audio_preprocessor_env("clearvoice_mossformer2_se") == python
+    install_commands = [cmd for cmd, _ in commands if "install" in cmd]
+    assert len(install_commands) == 1
+    install_cmd = install_commands[0]
+    assert "--no-deps" in install_cmd
+    assert "torch==2.8.0" not in install_cmd
+    assert "numpy==1.26.4" in install_cmd
+    assert "librosa==0.10.2.post1" in install_cmd
+    assert "soundfile==0.12.1" in install_cmd
+
+
 def test_optional_heavy_runtimes_are_uv_managed():
     requirements = Path("requirements.txt").read_text(encoding="utf-8").lower()
     manager = Path("model_manager.py").read_text(encoding="utf-8")
 
     assert "uv>=0.8,<1.0" in requirements
     assert 'PREPROCESS_ENVS_DIR = APP_DIR / ".preprocess-envs"' in manager
-    assert '"ffmpeg_package": "imageio-ffmpeg==0.6.0"' in manager
     assert 'packages = ["demucs==4.1.0"]' in manager
+    assert '"rnnoise"' not in manager.lower()
     assert "audio-separator" not in manager
     assert '"clearvoice==0.1.2"' in manager
