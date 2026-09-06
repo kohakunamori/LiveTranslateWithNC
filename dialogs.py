@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from model_manager import download_asr, download_silero
+from model_manager import download_asr, download_audio_preprocessor, download_silero
 from i18n import t, get_lang
 
 log = logging.getLogger("LiveTranslate.Dialogs")
@@ -451,6 +451,9 @@ class ModelDownloadDialog(QDialog):
                     download_asr(
                         "whisper", model_size=size, hub=self._hub, proxy=self._proxy
                     )
+                elif m["type"].startswith("preprocess:"):
+                    mode = m["type"].split(":", 1)[1]
+                    download_audio_preprocessor(mode, proxy=self._proxy)
         except Exception as e:
             self._error = str(e)
             log.error(f"Download failed: {e}", exc_info=True)

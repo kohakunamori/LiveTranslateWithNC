@@ -44,8 +44,11 @@ from model_manager import (
     funasr_supports_padding,
     format_size,
     get_cache_entries,
+    get_missing_audio_preprocessor,
+    is_audio_preprocessor_ready,
     list_local_faster_whisper_models,
     migrate_funasr_settings,
+    normalize_audio_preprocess_mode,
     normalize_funasr_model_key,
     resolve_custom_whisper_model,
 )
@@ -107,6 +110,7 @@ class ControlPanel(QWidget):
             self._current_settings = {
                 "vad_mode": "silero",
                 "vad_threshold": config["asr"]["vad_threshold"],
+                "audio_preprocess_mode": config["audio"].get("preprocess_mode", "off"),
                 "energy_threshold": 0.02,
                 "min_speech_duration": config["asr"]["min_speech_duration"],
                 "max_speech_duration": config["asr"]["max_speech_duration"],
@@ -162,6 +166,11 @@ class ControlPanel(QWidget):
         self._current_settings.setdefault(
             "whisper_pad_seconds",
             config["asr"].get("whisper_pad_seconds", 0.5),
+        )
+        self._current_settings["audio_preprocess_mode"] = normalize_audio_preprocess_mode(
+            self._current_settings.get(
+                "audio_preprocess_mode", config["audio"].get("preprocess_mode", "off")
+            )
         )
 
         layout = QVBoxLayout(self)
@@ -419,6 +428,43 @@ class ControlPanel(QWidget):
         remote_layout.addWidget(self._remote_url_edit, 1)
         layout.addWidget(self._remote_group)
         self._remote_group.setVisible(engine_idx == 3)
+
+        preprocess_group = QGroupBox(t("group_audio_preprocess"))
+        preprocess_layout = QGridLayout(preprocess_group)
+        preprocess_layout.setColumnStretch(1, 1)
+        self._audio_preprocess_mode = QComboBox()
+        self._audio_preprocess_mode.addItem(t("preprocess_off"), "off")
+        self._audio_preprocess_mode.addItem("RNNoise", "rnnoise")
+        self._audio_preprocess_mode.addItem("Demucs v4", "demucs_v4")
+        self._audio_preprocess_mode.addItem(
+            "ClearerVoice / MossFormer2 SE", "clearvoice_mossformer2_se"
+        )
+        saved_preprocess = normalize_audio_preprocess_mode(
+            s.get("audio_preprocess_mode", "off")
+        )
+        preprocess_idx = self._audio_preprocess_mode.findData(saved_preprocess)
+        if preprocess_idx >= 0:
+            self._audio_preprocess_mode.setCurrentIndex(preprocess_idx)
+        self._audio_preprocess_mode.currentIndexChanged.connect(
+            self._on_audio_preprocess_mode_changed
+        )
+        preprocess_layout.addWidget(QLabel(t("label_preprocess_mode")), 0, 0)
+        preprocess_layout.addWidget(self._audio_preprocess_mode, 0, 1, 1, 2)
+
+        self._audio_preprocess_status = QLabel("")
+        self._audio_preprocess_status.setStyleSheet("color: #888; font-size: 11px;")
+        preprocess_layout.addWidget(self._audio_preprocess_status, 1, 0, 1, 2)
+        self._audio_preprocess_download = QPushButton(t("btn_download_preprocessor"))
+        self._audio_preprocess_download.clicked.connect(
+            self._download_audio_preprocessor
+        )
+        preprocess_layout.addWidget(self._audio_preprocess_download, 1, 2)
+        hint = QLabel(t("audio_preprocess_hint"))
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888; font-size: 11px;")
+        preprocess_layout.addWidget(hint, 2, 0, 1, 3)
+        layout.addWidget(preprocess_group)
+        self._update_audio_preprocess_status()
 
         mode_group = QGroupBox(t("group_vad_mode"))
         mode_layout = QVBoxLayout(mode_group)
@@ -1359,6 +1405,60 @@ class ControlPanel(QWidget):
     def _on_silence_mode_changed(self, index):
         self._silence_duration.setEnabled(index == 1)
 
+    def _selected_audio_preprocess_mode(self) -> str:
+        value = self._audio_preprocess_mode.currentData()
+        return normalize_audio_preprocess_mode(str(value) if value else "off")
+
+    def _update_audio_preprocess_status(self):
+        mode = self._selected_audio_preprocess_mode()
+        if mode == "off":
+            self._audio_preprocess_status.setText(t("preprocess_disabled_status"))
+            self._audio_preprocess_status.setStyleSheet("color: #888; font-size: 11px;")
+            self._audio_preprocess_download.setEnabled(False)
+            return
+
+        if is_audio_preprocessor_ready(mode):
+            self._audio_preprocess_status.setText(t("preprocess_ready"))
+            self._audio_preprocess_status.setStyleSheet("color: #4a4; font-size: 11px;")
+            self._audio_preprocess_download.setEnabled(False)
+            return
+
+        missing = get_missing_audio_preprocessor(mode)
+        estimated = sum(int(m.get("estimated_bytes", 0)) for m in missing)
+        size_text = format_size(estimated) if estimated else ""
+        self._audio_preprocess_status.setText(
+            t("preprocess_not_ready").format(size=size_text)
+        )
+        self._audio_preprocess_status.setStyleSheet("color: #b85; font-size: 11px;")
+        self._audio_preprocess_download.setEnabled(bool(missing))
+
+    def _on_audio_preprocess_mode_changed(self, _index):
+        self._current_settings["audio_preprocess_mode"] = (
+            self._selected_audio_preprocess_mode()
+        )
+        self._update_audio_preprocess_status()
+        self._auto_save()
+
+    def _download_audio_preprocessor(self):
+        mode = self._selected_audio_preprocess_mode()
+        if mode == "off" or is_audio_preprocessor_ready(mode):
+            self._update_audio_preprocess_status()
+            return
+        missing = get_missing_audio_preprocessor(mode)
+        if not missing:
+            return
+        from dialogs import ModelDownloadDialog
+
+        dlg = ModelDownloadDialog(
+            missing,
+            hub=self._current_settings.get("hub", "ms"),
+            proxy=self._current_settings.get("download_proxy", "system"),
+            parent=self,
+        )
+        if dlg.exec() == dlg.DialogCode.Accepted:
+            self._update_audio_preprocess_status()
+            self._auto_save()
+
     def _on_vad_mode_changed(self, index):
         modes = ["silero", "energy", "disabled"]
         self._current_settings["vad_mode"] = modes[index]
@@ -1460,6 +1560,9 @@ class ControlPanel(QWidget):
         )
         dev_text = self._asr_device.currentText()
         self._current_settings["asr_device"] = dev_text.split(" (")[0]
+        self._current_settings["audio_preprocess_mode"] = (
+            self._selected_audio_preprocess_mode()
+        )
         audio_idx = self._audio_device.currentIndex()
         if audio_idx == 0:
             self._current_settings["audio_device"] = "__disabled__"

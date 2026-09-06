@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 *.pyo
 .venv/
+.preprocess-envs/
 .pip-cache/
 .uv-cache/
 .tmp/

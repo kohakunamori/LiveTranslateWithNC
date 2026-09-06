@@ -20,7 +20,8 @@ Windows 实时音频翻译工具。捕获系统音频（WASAPI loopback）和可
 
 ## 功能特性
 
-- **实时翻译管线**：系统音频 → VAD → ASR → LLM 翻译 → 字幕显示
+- **实时翻译管线**：系统音频 → 可选音频预处理 → VAD → ASR → LLM 翻译 → 字幕显示
+- **音频预处理**：关闭 / RNNoise / Demucs v4 / ClearerVoice（MossFormer2 SE），重模型按需使用独立运行环境
 - **多 ASR 引擎**：faster-whisper、SenseVoice、FunASR Nano、Anime-Whisper
 - **远程 ASR**：通过 HTTP 把语音识别放到 GPU 机器上跑 —— 见 [REMOTE_ASR.md](REMOTE_ASR.md)
 - **兼容任意 OpenAI 格式 API**：DeepSeek、Grok、Qwen、GPT、Ollama、vLLM 等
@@ -105,16 +106,29 @@ pip install -r requirements.txt
 | Model | `deepseek-chat` |
 | 代理 | `none` / `system` / 自定义地址 |
 
+## 音频预处理
+
+设置 → VAD / ASR → 音频预处理：
+
+- `关闭`：保持原有采集音频直接进入 VAD 的行为。
+- `RNNoise`：轻量语音降噪，约 0.5 秒窗口缓冲。
+- `Demucs v4`：人声/伴奏分离，使用约 8 秒上下文窗口，强烈建议 CUDA。
+- `ClearerVoice / MossFormer2 SE`：语音增强，使用约 4 秒上下文窗口，强烈建议 CUDA。
+
+预处理模型沿用项目现有模型下载窗口下载。Demucs 与 ClearerVoice 使用 `.preprocess-envs/` 下的独立 uv 环境，避免它们的 PyTorch / 音频依赖污染主 ASR 环境。开启后，处理后的 PCM 会先进入 VAD，因此 VAD、ASR、翻译和所有后续步骤都基于预处理后的音频工作。
+
 ## 架构
 
 ```
-Audio (WASAPI 32ms) → VAD (Silero) → ASR → LLM Translation → Overlay
+Audio (WASAPI 32ms) → 可选 AudioPreprocessor → VAD (Silero) → ASR → LLM Translation → Overlay
          ↑ 可选麦克风混音
 ```
 
 ```
 main.py                 主入口，管线编排
 ├── audio_capture.py    WASAPI loopback + 麦克风混音
+├── audio_preprocessor.py 可选预处理缓冲与调度
+├── audio_preprocess_worker.py 隔离的 RNNoise / Demucs / ClearVoice worker
 ├── vad_processor.py    Silero VAD
 ├── asr_engine.py       faster-whisper 后端
 ├── asr_funasr.py       统一 FunASR 模型选择后端

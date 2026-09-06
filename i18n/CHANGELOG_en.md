@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-09-05
+- Added optional audio preprocessing before VAD with four modes: Off, RNNoise, Demucs v4, and ClearerVoice / MossFormer2 SE
+- Preprocessed PCM now feeds VAD first, so ASR, translation, and all downstream stages consistently operate on the enhanced/separated audio
+- Added asynchronous persistent workers for heavy preprocessors so GPU inference does not block the audio-capture thread; Demucs and ClearVoice use isolated uv-managed runtimes
+- Integrated preprocessing assets into the existing model download/cache UI; RNNoise now installs a managed FFmpeg runtime with `arnndn` support via uv and requires no system FFmpeg
+
 ## 2026-08-17
 - Incremental ASR sentence segmentation switched from PySBD to yasbd-lib (#37): API-compatible with no behavior change, adds native rules for Korean and 16 more languages (Korean previously fell back to English rules), and is much faster on long text
 - Fixed empty translations showing up as untranslated same-language text with DeepSeek (#38): DeepSeek defaults to thinking mode ON and only accepts thinking.type=disabled to turn it off, while the previously sent enable_thinking=false is a Qwen-style flag it ignores; the model edit dialog now has a "Disable thinking" style selector (auto-detect / DeepSeek·Volcano Ark·GLM / Qwen·DashScope·SiliconFlow / self-hosted vLLM·SGLang / OpenAI·Grok reasoning_effort / do not send), auto-detect no longer sends unknown parameters to official OpenAI-style endpoints that reject them, and a diagnostic warning is logged when reasoning burns the whole token budget and returns an empty completion

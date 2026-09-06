@@ -19,14 +19,17 @@ from datetime import datetime
 from model_manager import (
     DEFAULT_FUNASR_MODEL,
     apply_cache_env,
+    audio_preprocessor_display_name,
     funasr_display_name,
     funasr_supports_padding,
+    is_audio_preprocessor_ready,
     get_missing_models,
     is_asr_cached,
     ASR_DISPLAY_NAMES,
     MODELS_DIR,
     local_faster_whisper_display_name,
     migrate_funasr_settings,
+    normalize_audio_preprocess_mode,
     normalize_asr_engine_selection,
     normalize_funasr_model_key,
     resolve_custom_whisper_model,
@@ -41,6 +44,7 @@ import os
 import torch  # noqa: F401
 
 from audio_capture import AudioCapture
+from audio_preprocessor import AudioPreprocessor
 from vad_processor import VADProcessor
 from asr_client import ASRClient, ASRWorkerError, ASRWorkerExited, ASRWorkerTimeout
 from translator import Translator, RepetitionError
@@ -167,6 +171,13 @@ class LiveTranslateApp:
             sample_rate=config["audio"]["sample_rate"],
             chunk_duration=config["audio"]["chunk_duration"],
         )
+        self._audio_preprocess_mode = "off"
+        self._audio_preprocessor = AudioPreprocessor(
+            "off",
+            sample_rate=config["audio"]["sample_rate"],
+            chunk_duration=config["audio"]["chunk_duration"],
+        )
+        self._audio_preprocess_lock = threading.RLock()
         self._vad = VADProcessor(
             sample_rate=config["audio"]["sample_rate"],
             threshold=config["asr"]["vad_threshold"],
@@ -283,6 +294,15 @@ class LiveTranslateApp:
 
     def _on_settings_changed(self, settings):
         self._vad.update_settings(settings)
+        if "audio_preprocess_mode" in settings:
+            mode = normalize_audio_preprocess_mode(settings["audio_preprocess_mode"])
+            if mode == "off" or is_audio_preprocessor_ready(mode):
+                self._switch_audio_preprocessor(mode)
+            elif mode != self._audio_preprocess_mode:
+                log.info(
+                    f"Audio preprocessor selected but not ready: "
+                    f"{audio_preprocessor_display_name(mode)}"
+                )
         if "style" in settings and self._overlay:
             self._overlay.apply_style(settings["style"])
         if "asr_language" in settings:
@@ -311,6 +331,8 @@ class LiveTranslateApp:
             old_device = self._audio._device_name
             self._audio.set_device(settings["audio_device"])
             if old_device != settings.get("audio_device"):
+                with self._audio_preprocess_lock:
+                    self._audio_preprocessor.reset()
                 self._vad.flush()
                 self._vad._reset()
                 if self._overlay:
@@ -329,6 +351,93 @@ class LiveTranslateApp:
             self._translator.set_timeout(settings["timeout"])
         if "auto_save_transcript" in settings:
             self._transcript.set_enabled(settings["auto_save_transcript"])
+
+    def _switch_audio_preprocessor(self, mode: str):
+        mode = normalize_audio_preprocess_mode(mode)
+        with self._audio_preprocess_lock:
+            current = self._audio_preprocessor
+            if current.mode == mode and current.started:
+                self._audio_preprocess_mode = mode
+                return
+
+        if mode != "off" and not is_audio_preprocessor_ready(mode):
+            log.warning(
+                f"Cannot enable audio preprocessor; model/runtime is not ready: "
+                f"{audio_preprocessor_display_name(mode)}"
+            )
+            return
+
+        display_name = audio_preprocessor_display_name(mode)
+        if mode == "off":
+            replacement = AudioPreprocessor(
+                "off",
+                sample_rate=self._config["audio"]["sample_rate"],
+                chunk_duration=self._config["audio"]["chunk_duration"],
+            )
+        else:
+            parent = (
+                self._panel if self._panel and self._panel.isVisible() else self._overlay
+            )
+            dlg = _ModelLoadDialog(
+                t("loading_model").format(name=display_name), parent=parent
+            )
+            loaded = [None]
+            load_error = [None]
+
+            def _load_preprocessor():
+                try:
+                    worker = AudioPreprocessor(
+                        mode,
+                        sample_rate=self._config["audio"]["sample_rate"],
+                        chunk_duration=self._config["audio"]["chunk_duration"],
+                    )
+                    worker.start()
+                    loaded[0] = worker
+                except Exception as exc:
+                    load_error[0] = str(exc)
+                    log.error(
+                        f"Failed to load audio preprocessor {display_name}: {exc}",
+                        exc_info=True,
+                    )
+
+            thread = threading.Thread(target=_load_preprocessor, daemon=True)
+            thread.start()
+            poll_timer = QTimer()
+
+            def _check_preprocessor_load():
+                if not thread.is_alive():
+                    poll_timer.stop()
+                    dlg.accept()
+
+            poll_timer.setInterval(100)
+            poll_timer.timeout.connect(_check_preprocessor_load)
+            poll_timer.start()
+            dlg.exec()
+            poll_timer.stop()
+
+            if load_error[0] or loaded[0] is None:
+                QMessageBox.warning(
+                    parent,
+                    "LiveTranslate",
+                    f"Failed to load {display_name}:\n{load_error[0] or 'unknown error'}",
+                )
+                return
+            replacement = loaded[0]
+
+        with self._audio_preprocess_lock:
+            old = self._audio_preprocessor
+            self._audio_preprocessor = replacement
+            self._audio_preprocess_mode = mode
+        old.close()
+        with self._vad_lock:
+            self._vad.flush()
+            self._vad._reset()
+        if self._overlay:
+            self._overlay.update_monitor(0.0, 0.0)
+        log.info(
+            f"Audio preprocessing mode: {display_name} "
+            f"(before VAD, buffer={replacement.latency_seconds:.2f}s)"
+        )
 
     def _mark_asr_unavailable(self, reason: str, client=None):
         with self._asr_lock:
@@ -558,6 +667,8 @@ class LiveTranslateApp:
         self._last_interim_samples = 0
         self._last_interim_check_time = 0.0
         self._interim_committed_tail = ""
+        with self._audio_preprocess_lock:
+            self._audio_preprocessor.reset()
         self._vad.flush()
         self._vad._reset()
 
@@ -1199,12 +1310,32 @@ class LiveTranslateApp:
         if self._capture_thread:
             self._capture_thread.join(timeout=3)
             self._capture_thread = None
+        # A buffered preprocessor may still own the last <window> seconds. Process
+        # that tail before the final VAD flush so ASR never receives raw bypass
+        # audio when preprocessing was enabled.
+        preprocess_tail_segments = []
+        try:
+            with self._audio_preprocess_lock:
+                tail_chunks = self._audio_preprocessor.flush()
+            for tail_chunk in tail_chunks:
+                with self._vad_lock:
+                    seg = self._vad.process_chunk(tail_chunk)
+                if seg is not None:
+                    preprocess_tail_segments.append(seg)
+        except Exception as exc:
+            log.error(f"Failed to flush audio preprocessor: {exc}", exc_info=True)
+        finally:
+            with self._audio_preprocess_lock:
+                self._audio_preprocessor.close()
         self._asr_queue.put(None)
         if self._asr_thread:
             self._asr_thread.join(timeout=10)
             if self._asr_thread.is_alive():
                 log.warning("ASR thread still running after timeout, proceeding with cleanup")
             self._asr_thread = None
+        for segment in preprocess_tail_segments:
+            if self._asr_ready:
+                self._process_segment(segment)
         # Flush remaining VAD buffer after pipeline threads are done
         if self._interim_active:
             remaining = self._vad.force_flush()
@@ -1239,6 +1370,8 @@ class LiveTranslateApp:
 
     def pause(self):
         self._paused = True
+        with self._audio_preprocess_lock:
+            self._audio_preprocessor.reset()
         self._interim_active = False
         self._interim_pending = ""
         self._last_interim_samples = 0
@@ -1620,6 +1753,43 @@ class LiveTranslateApp:
 
         self._process_segment_text(original_text, result["language"], asr_ms)
 
+    def _process_vad_input_chunk(self, chunk: np.ndarray, mic_rms: float = 0.0):
+        """Feed one *preprocessed* PCM chunk into VAD and downstream scheduling."""
+        rms = float(np.sqrt(np.mean(chunk**2)))
+
+        if self._overlay:
+            self._overlay.update_monitor(rms, self._vad.last_confidence, mic_rms)
+
+        with self._vad_lock:
+            speech_segment = self._vad.process_chunk(chunk)
+
+        if speech_segment is None:
+            # Still accumulating — check for interim ASR.
+            if (
+                self._incremental_enabled
+                and self._asr_ready
+                and self._vad._is_speaking
+            ):
+                buf_samples = self._vad._speech_samples
+                total_dur = buf_samples / 16000
+                elapsed = (buf_samples - self._last_interim_samples) / 16000
+                now = time.perf_counter()
+                cooldown = now - self._last_interim_check_time
+                if (
+                    total_dur >= self._interim_interval
+                    and elapsed >= self._interim_interval
+                    and cooldown >= 1.0
+                ):
+                    self._last_interim_check_time = now
+                    self._enqueue_asr("interim", None)
+            return
+
+        if not self._asr_ready:
+            log.debug("ASR not ready, dropping segment")
+            return
+
+        self._enqueue_asr("vad_flush", speech_segment)
+
     def _capture_loop(self):
         silence_chunk = np.zeros(
             int(
@@ -1631,7 +1801,28 @@ class LiveTranslateApp:
         while self._running:
             item = self._audio.get_audio(timeout=1.0)
             if item is None:
+                if self._paused:
+                    continue
+
+                # A heavy preprocessor can finish a buffered window after the
+                # capture source becomes idle. Flush all real captured PCM through
+                # preprocessing before using synthetic zeroes to close the VAD
+                # segment; captured audio must never bypass the preprocessing stage.
+                try:
+                    with self._audio_preprocess_lock:
+                        tail_chunks = self._audio_preprocessor.flush()
+                    for processed_chunk in tail_chunks:
+                        self._process_vad_input_chunk(processed_chunk, 0.0)
+                except Exception as exc:
+                    log.error(
+                        f"Audio preprocessing idle flush failed: {exc}",
+                        exc_info=True,
+                    )
+
                 if self._vad._is_speaking and not self._paused:
+                    # These zero chunks are VAD control padding generated only
+                    # after all captured PCM has been preprocessed. Running them
+                    # through Demucs/ClearVoice would add seconds of useless work.
                     n = self._vad._get_effective_silence_limit() + 1
                     for _ in range(n):
                         with self._vad_lock:
@@ -1646,33 +1837,35 @@ class LiveTranslateApp:
             if self._paused:
                 continue
 
-            rms = float(np.sqrt(np.mean(chunk**2)))
+            try:
+                with self._audio_preprocess_lock:
+                    processed_chunks = self._audio_preprocessor.process_chunk(chunk)
+            except Exception as exc:
+                log.error(
+                    f"Audio preprocessing failed; falling back to Off: {exc}",
+                    exc_info=True,
+                )
+                with self._audio_preprocess_lock:
+                    failed = self._audio_preprocessor
+                    self._audio_preprocessor = AudioPreprocessor(
+                        "off",
+                        sample_rate=self._config["audio"]["sample_rate"],
+                        chunk_duration=self._config["audio"]["chunk_duration"],
+                    )
+                    self._audio_preprocess_mode = "off"
+                    failed.close()
+                processed_chunks = [np.asarray(chunk, dtype=np.float32)]
 
-            if self._overlay:
-                self._overlay.update_monitor(rms, self._vad.last_confidence, mic_rms)
+            if not processed_chunks and self._overlay:
+                # Heavy preprocessors intentionally buffer several seconds. Keep
+                # the raw level meter alive while VAD waits for processed PCM.
+                raw_rms = float(np.sqrt(np.mean(chunk**2)))
+                self._overlay.update_monitor(
+                    raw_rms, self._vad.last_confidence, mic_rms
+                )
 
-            with self._vad_lock:
-                speech_segment = self._vad.process_chunk(chunk)
-
-            if speech_segment is None:
-                # Still accumulating — check for interim ASR
-                if (self._incremental_enabled and self._asr_ready
-                        and self._vad._is_speaking):
-                    buf_samples = self._vad._speech_samples
-                    total_dur = buf_samples / 16000
-                    elapsed = (buf_samples - self._last_interim_samples) / 16000
-                    now = time.perf_counter()
-                    cooldown = now - self._last_interim_check_time
-                    if total_dur >= self._interim_interval and elapsed >= self._interim_interval and cooldown >= 1.0:
-                        self._last_interim_check_time = now
-                        self._enqueue_asr("interim", None)
-                continue
-
-            if not self._asr_ready:
-                log.debug("ASR not ready, dropping segment")
-                continue
-
-            self._enqueue_asr("vad_flush", speech_segment)
+            for processed_chunk in processed_chunks:
+                self._process_vad_input_chunk(processed_chunk, mic_rms)
 
     def _enqueue_asr(self, seg_type: str, segment):
         try:

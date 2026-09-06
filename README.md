@@ -20,7 +20,8 @@ Works with any system audio — videos, livestreams, voice chat. No player modif
 
 ## Features
 
-- **Real-time pipeline**: System audio → VAD → ASR → LLM translation → overlay
+- **Real-time pipeline**: System audio → optional preprocessing → VAD → ASR → LLM translation → overlay
+- **Audio preprocessing**: Off / RNNoise / Demucs v4 / ClearerVoice (MossFormer2 SE), with isolated on-demand model runtimes
 - **Multiple ASR engines**: faster-whisper, SenseVoice, FunASR Nano, Anime-Whisper
 - **Remote ASR**: offload speech recognition to a GPU machine over HTTP — see [REMOTE_ASR.md](REMOTE_ASR.md)
 - **Any OpenAI-compatible API**: DeepSeek, Grok, Qwen, GPT, Ollama, vLLM, etc.
@@ -105,16 +106,29 @@ Settings → Translation tab:
 | Model | `deepseek-chat` |
 | Proxy | `none` / `system` / custom URL |
 
+## Audio Preprocessing
+
+Settings → VAD / ASR → Audio Preprocessing:
+
+- `Off` — preserves the original capture → VAD behavior.
+- `RNNoise` — lightweight speech denoising, buffered in ~0.5 s windows.
+- `Demucs v4` — vocal/source separation using ~8 s windows; CUDA is strongly recommended.
+- `ClearerVoice / MossFormer2 SE` — speech enhancement using ~4 s windows; CUDA is strongly recommended.
+
+Optional preprocessing assets are downloaded from the existing model-download dialog. Demucs and ClearerVoice use isolated uv environments under `.preprocess-envs/` so their PyTorch/audio dependencies do not modify the main ASR environment. When enabled, the processed PCM is fed into VAD first, so VAD, ASR, translation, and every downstream stage all operate on the preprocessed audio.
+
 ## Architecture
 
 ```
-Audio (WASAPI 32ms) → VAD (Silero) → ASR → LLM Translation → Overlay
+Audio (WASAPI 32ms) → optional AudioPreprocessor → VAD (Silero) → ASR → LLM Translation → Overlay
          ↑ optional mic mix-in
 ```
 
 ```
 main.py                 Entry point & pipeline
 ├── audio_capture.py    WASAPI loopback + mic mix-in
+├── audio_preprocessor.py Optional buffered preprocessing controller
+├── audio_preprocess_worker.py Isolated RNNoise / Demucs / ClearVoice worker
 ├── vad_processor.py    Silero VAD
 ├── asr_engine.py       faster-whisper backend
 ├── asr_funasr.py       Unified FunASR model selector backend
