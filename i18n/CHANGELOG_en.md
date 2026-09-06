@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-09-06
+- Fixed intermittent Silero VAD degradation across long-running sessions by resetting the model's recurrent state at segment and stream boundaries, including pause/resume, detector-mode changes, audio-device changes, and ASR-engine switches
+- VAD settings updates are now serialized with the capture thread, preventing detector state from being mutated concurrently while audio chunks are being evaluated
+- Added optional machine-local Demucs/ClearVoice runtime overrides so multiple LiveTranslate worktrees can reuse the same heavy uv environments instead of duplicating multi-gigabyte dependencies
+
 ## 2026-09-05
 - Added optional audio preprocessing before VAD with four modes: Off, RNNoise, Demucs v4, and ClearerVoice / MossFormer2 SE
 - Preprocessed PCM now feeds VAD first, so ASR, translation, and all downstream stages consistently operate on the enhanced/separated audio

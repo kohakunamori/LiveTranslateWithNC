@@ -1,5 +1,10 @@
 # 更新日志
 
+## 2026-09-06
+- 修复 Silero VAD 长时间运行后偶发识别退化的问题：在分段/流边界重置模型 recurrent state，并覆盖暂停/恢复、VAD 模式切换、音频设备切换与 ASR 引擎切换等场景
+- VAD 设置更新现在与音频采集线程串行化，避免处理音频 chunk 时并发修改检测器状态
+- 新增 Demucs/ClearVoice 本机共享 runtime override，可让多个 LiveTranslate 工作区复用同一套重型 uv 环境，避免重复占用数 GB 空间
+
 ## 2026-09-05
 - 新增 VAD 前音频预处理，支持「关闭 / RNNoise / Demucs v4 / ClearerVoice / MossFormer2 SE」四种模式
 - 开启后处理后的 PCM 会先进入 VAD，因此 ASR、翻译和所有后续流程都统一基于增强/分离后的音频工作

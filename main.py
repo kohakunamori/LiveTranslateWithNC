@@ -293,7 +293,8 @@ class LiveTranslateApp:
             self._overlay.set_models(models, active_idx)
 
     def _on_settings_changed(self, settings):
-        self._vad.update_settings(settings)
+        with self._vad_lock:
+            self._vad.update_settings(settings)
         if "audio_preprocess_mode" in settings:
             mode = normalize_audio_preprocess_mode(settings["audio_preprocess_mode"])
             if mode == "off" or is_audio_preprocessor_ready(mode):
@@ -333,8 +334,8 @@ class LiveTranslateApp:
             if old_device != settings.get("audio_device"):
                 with self._audio_preprocess_lock:
                     self._audio_preprocessor.reset()
-                self._vad.flush()
-                self._vad._reset()
+                with self._vad_lock:
+                    self._vad._reset()
                 if self._overlay:
                     self._overlay.update_monitor(0.0, 0.0)
         if "mic_device" in settings:
@@ -669,8 +670,8 @@ class LiveTranslateApp:
         self._interim_committed_tail = ""
         with self._audio_preprocess_lock:
             self._audio_preprocessor.reset()
-        self._vad.flush()
-        self._vad._reset()
+        with self._vad_lock:
+            self._vad._reset()
 
         cached = is_asr_cached(engine_type, cache_model_key, hub)
         display_name = ASR_DISPLAY_NAMES.get(engine_type, engine_type)
@@ -1372,6 +1373,8 @@ class LiveTranslateApp:
         self._paused = True
         with self._audio_preprocess_lock:
             self._audio_preprocessor.reset()
+        with self._vad_lock:
+            self._vad._reset()
         self._interim_active = False
         self._interim_pending = ""
         self._last_interim_samples = 0

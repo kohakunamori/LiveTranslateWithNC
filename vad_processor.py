@@ -95,6 +95,7 @@ class VADProcessor:
             self._silence_limit = new_limit
 
     def update_settings(self, settings: dict):
+        old_mode = self.mode
         if "vad_mode" in settings:
             self.mode = settings["vad_mode"]
         if "vad_threshold" in settings:
@@ -115,6 +116,12 @@ class VADProcessor:
             self._fixed_silence_dur = settings["silence_duration"]
             if self._silence_mode == "fixed":
                 self._silence_limit = self._seconds_to_chunks(self._fixed_silence_dur)
+        if self.mode != old_mode:
+            # Silero is stateful. Switching to/from another detector leaves a gap
+            # in the stream seen by the recurrent model, and confidence history
+            # from different detector modes is not comparable. Start a fresh VAD
+            # stream at the mode boundary.
+            self._reset()
         log.info(
             f"VAD settings updated: mode={self.mode}, threshold={self.threshold}, "
             f"silence={self._silence_mode} "
@@ -343,6 +350,15 @@ class VADProcessor:
         self._is_speaking = False
         self._silence_counter = 0
         self._was_trimmed = False
+        if hasattr(self, "_pre_buffer"):
+            self._pre_buffer.clear()
+        # Silero's JIT/ONNX model keeps recurrent hidden state across calls.
+        # Logical segment/stream boundaries must reset it as well; otherwise
+        # later audio can inherit stale state and detection degrades or appears
+        # to stop working after pause/device/mode changes.
+        reset_states = getattr(self._model, "reset_states", None)
+        if callable(reset_states):
+            reset_states()
 
     def peek_buffer(self):
         """Read current speech buffer without flushing. Returns (audio, duration) or None."""
