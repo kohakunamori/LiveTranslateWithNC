@@ -2,6 +2,7 @@ from pathlib import Path
 import threading
 
 import numpy as np
+import pytest
 import yaml
 
 import model_manager
@@ -37,11 +38,12 @@ def test_off_mode_preserves_capture_pcm_contract():
     assert output[0].dtype == np.float32
 
 
-def test_buffered_preprocessor_returns_original_32ms_chunk_shape(monkeypatch):
+@pytest.mark.parametrize(
+    "mode", ["rnnoise", "demucs_v4", "clearvoice_mossformer2_se"]
+)
+def test_buffered_preprocessor_returns_original_32ms_chunk_shape(monkeypatch, mode):
     """Exercise buffering/async scheduling without loading an external model."""
-    preprocessor = AudioPreprocessor(
-        "rnnoise", sample_rate=16000, chunk_duration=0.032
-    )
+    preprocessor = AudioPreprocessor(mode, sample_rate=16000, chunk_duration=0.032)
     monkeypatch.setattr(preprocessor, "start", lambda: None)
     monkeypatch.setattr(
         preprocessor,
@@ -182,6 +184,18 @@ def test_rnnoise_managed_runtime_installer_extracts_imageio_binary(
     assert installed == model_dir / "runtime" / "ffmpeg.exe"
     assert installed.read_bytes() == b"managed-ffmpeg"
     assert not any((tmp_path / ".tmp").glob("rnnoise-ffmpeg-*"))
+
+
+def test_external_preprocessor_runtime_can_be_reused(monkeypatch, tmp_path):
+    shared_env = tmp_path / "shared-demucs"
+    python = shared_env / "Scripts" / "python.exe"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"stub")
+
+    monkeypatch.setenv("LIVETRANSLATE_DEMUCS_PYTHON", str(shared_env))
+
+    assert model_manager.audio_preprocessor_env_python("demucs_v4") == python
+    assert model_manager._ensure_audio_preprocessor_env("demucs_v4") == python
 
 
 def test_optional_heavy_runtimes_are_uv_managed():

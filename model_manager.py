@@ -69,6 +69,14 @@ MODELS_DIR = APP_DIR / "models"
 PREPROCESS_ENVS_DIR = APP_DIR / ".preprocess-envs"
 PREPROCESS_MODELS_DIR = MODELS_DIR / "audio_preprocess"
 
+# Optional machine-local overrides let multiple projects reuse the same heavy
+# preprocessing runtimes without copying multi-gigabyte virtual environments.
+# Values may point either to python.exe directly or to the environment root.
+_PREPROCESS_ENV_PYTHON_KEYS = {
+    "demucs_v4": "LIVETRANSLATE_DEMUCS_PYTHON",
+    "clearvoice_mossformer2_se": "LIVETRANSLATE_CLEARVOICE_PYTHON",
+}
+
 PREPROCESSOR_PROFILES = {
     "off": {
         "display_name": "Off",
@@ -498,8 +506,25 @@ def audio_preprocessor_model_dir(mode: str | None) -> Path:
     return PREPROCESS_MODELS_DIR / mode
 
 
+def _external_audio_preprocessor_python(mode: str | None) -> Path | None:
+    mode = normalize_audio_preprocess_mode(mode)
+    env_key = _PREPROCESS_ENV_PYTHON_KEYS.get(mode)
+    if not env_key:
+        return None
+    value = os.environ.get(env_key)
+    if not value:
+        return None
+    path = Path(value).expanduser()
+    if path.is_dir():
+        path = path / "Scripts" / "python.exe"
+    return path
+
+
 def audio_preprocessor_env_python(mode: str | None) -> Path | None:
     mode = normalize_audio_preprocess_mode(mode)
+    external = _external_audio_preprocessor_python(mode)
+    if external is not None:
+        return external
     env_name = PREPROCESSOR_PROFILES[mode].get("env")
     if not env_name:
         return None
@@ -768,6 +793,17 @@ def _ensure_audio_preprocessor_env(mode: str) -> Path:
     env_name = profile.get("env")
     if not env_name:
         raise ValueError(f"{mode} does not use a Python runtime")
+
+    external = _external_audio_preprocessor_python(mode)
+    if external is not None:
+        if not external.is_file():
+            env_key = _PREPROCESS_ENV_PYTHON_KEYS[mode]
+            raise FileNotFoundError(
+                f"Configured external preprocessing runtime does not exist: "
+                f"{env_key}={external}"
+            )
+        log.info(f"Using shared preprocessing runtime: {external}")
+        return external
 
     uv = _uv_executable()
     env_dir = PREPROCESS_ENVS_DIR / env_name
